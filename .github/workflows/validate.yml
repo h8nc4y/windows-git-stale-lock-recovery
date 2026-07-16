@@ -1,0 +1,41 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate skill repository
+    # windows-latest is intentional and left unpinned: this job only needs
+    # pwsh + git, so runner image migrations do not affect it. Pin to a dated
+    # label only if a future step depends on image-specific tooling.
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Validate OSS readiness
+        shell: pwsh
+        run: ./scripts/validate-oss-readiness.ps1
+
+      - name: Test private marker scan
+        shell: pwsh
+        run: ./scripts/test-scan-private-markers.ps1
+
+      - name: Scan for private markers
+        shell: pwsh
+        run: ./scripts/scan-private-markers.ps1
+
+      - name: Check whitespace
+        shell: pwsh
+        # A fresh checkout has no worktree/index diff, so `git diff --check`
+        # would be vacuous here. Diff the committed tree against the empty
+        # tree (the SHA-1 empty-tree constant) so whitespace errors in
+        # committed content actually fail the job (exit 2 on findings).
+        run: git diff-tree --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
