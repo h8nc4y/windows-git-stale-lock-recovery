@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+.private-markers.local
+.cache/
+tmp/
+# Local agent/session configuration stays out of the public repository.
+.claude/

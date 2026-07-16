@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a sanitized problem with the skill or examples.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not paste tokens, credentials, raw agent transcripts with private data, private repository names, or internal absolute paths.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observable problem without private data.
+      placeholder: Following the skill, the five-point check passed but the deletion still...
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom class
+      options:
+        - Five-point check false pass (a lock that should not have been deleted was deletable)
+        - Five-point check false refusal (a genuinely stale lock never becomes deletable)
+        - Bulk cleanup issue (mtime filter / TOCTOU guard / glob substitution)
+        - Post-merge local sync issue (wrong-branch fast-forward / default branch discovery)
+        - Prevention gap (--no-optional-locks / GIT_OPTIONAL_LOCKS did not prevent a lock)
+        - Exclusive-open test issue (false positive / false negative)
+        - Documentation error or unclear guidance
+        - Other sanitized symptom
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized-checks
+    attributes:
+      label: Sanitized checks performed
+      description: Summarize safe facts only. Use placeholder repo and path names.
+      placeholder: |
+        Lock: <repo>/.git/index.lock, size 0, mtime 2 hours old
+        Process check: no git.exe running
+        Exclusive open: succeeded
+        Deletion: succeeded, but git add still failed with...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: After all five checks passed and the lock was deleted, git add should succeed.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: A new index.lock reappeared immediately even though no git process was visible.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed tokens, credentials, customer data, private repository names, and internal absolute paths.
+          required: true
