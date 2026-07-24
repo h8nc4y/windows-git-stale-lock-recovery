@@ -12,7 +12,9 @@ permissions:
 jobs:
   validate:
     name: Validate skill repository
-    timeout-minutes: 10
+    # Windows PowerShell 5.1 の完全な adversarial fixture は hosted runner で
+    # 7 分超かかるため、前段の pwsh suite と合わせても途中取消されない上限にする。
+    timeout-minutes: 25
     # windows-latest is intentional and left unpinned: this job only needs
     # pwsh + git, so runner image migrations do not affect it. Pin to a dated
     # label only if a future step depends on image-specific tooling.
