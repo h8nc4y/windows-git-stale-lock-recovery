@@ -17,7 +17,9 @@ verify.
 - Use synthetic placeholders such as `<repo>`, `<workspace-root>`,
   `<pr-number>`, and `<default>` for examples.
 - Put personal or organization-specific scan markers in an untracked
-  `.private-markers.local` file, not in repository source.
+  `.private-markers.local` file, not in repository source. The scanner rejects
+  a tracked copy and bounds local marker input to 64 KiB, 100 markers, and
+  1,024 characters per marker.
 
 ## Grounding Rules
 
@@ -63,6 +65,25 @@ pwsh -NoProfile -File .\scripts\validate-oss-readiness.ps1
 pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
+
+The private-marker self-test always launches scanner children with the same
+PowerShell host that launched the self-test. Running the `powershell` and
+`pwsh` command sets above therefore provides two distinct compatibility
+measurements; one invocation is not silently substituted for the other.
+On Windows, the synthetic test compiles a local native Git probe wrapper to
+verify the actual sanitized child environment, malformed/path-escape
+rejection, the six-child batch bound, exact stage/index-debug comparison
+after staged and flags-only mutations, atomic Job assignment, and descendant
+cleanup. The wrapper is never built or launched on POSIX.
+
+The portable real-Git fixtures run on Windows and POSIX. They cover exact-root
+handling, index/worktree provenance, real merge-conflict stages, real
+present/deleted `git add -N`, sensitive dotenv/PEM/key candidates, binary
+safe-skip behavior, the 8,192 text-entry bound, incremental allowlist
+evaluation, explicit nested `.git` directory/leaf exclusion, fixed raw root
+diagnostics, and bounded explicit-LF UTF-8 finding output. GitHub Actions runs
+the full PowerShell 7 suite on Ubuntu in addition to both Windows hosts. The
+tests do not contact a service or use real credentials.
 
 On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed, use
 forward slashes:

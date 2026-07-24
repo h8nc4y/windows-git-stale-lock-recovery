@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Path = ''
 )
@@ -53,6 +53,22 @@ function Assert-FileContains {
     $content = Get-Content -LiteralPath $filePath -Raw
     if ($content -notmatch $Pattern) {
         Add-Failure "$RelativePath is missing: $Description"
+    }
+}
+
+function Assert-Utf8Bom {
+    param([string]$RelativePath)
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($filePath)
+    if ($bytes.Length -lt 3 -or
+        $bytes[0] -ne 0xEF -or
+        $bytes[1] -ne 0xBB -or
+        $bytes[2] -ne 0xBF) {
+        Add-Failure "$RelativePath must use UTF-8 with BOM for Windows PowerShell 5.1."
     }
 }
 
@@ -121,6 +137,14 @@ foreach ($requiredFile in $requiredFiles) {
     Assert-FileExists -RelativePath $requiredFile
 }
 
+foreach ($powerShellScript in @(
+    'scripts/scan-private-markers.ps1',
+    'scripts/test-scan-private-markers.ps1',
+    'scripts/validate-oss-readiness.ps1'
+)) {
+    Assert-Utf8Bom -RelativePath $powerShellScript
+}
+
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Install' -Description 'installation instructions'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Validation' -Description 'validation instructions'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Contributing' -Description 'contribution guidance'
@@ -128,12 +152,27 @@ Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Security' -De
 Assert-FileContains -RelativePath 'README.md' -Pattern 'CONTRIBUTING\.md' -Description 'link to CONTRIBUTING.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'SECURITY\.md' -Description 'link to SECURITY.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Description 'link to the Japanese skill version'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)index blob.*worktree|worktree.*index blob' -Description 'index/worktree scanner provenance contract'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)cat-file --batch.*at most six Git children' -Description 'bounded batch Git child contract'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)ls-files -z --stage.*ls-files -z --stage --debug.*match exactly' -Description 'stable raw index and flags snapshot contract'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)8,192 text-entry.*16 MiB index-debug' -Description 'bounded index-layer contract'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)scan-root-resolution-failed.*never echoes.*PowerShell error framing' -Description 'fixed root-resolution diagnostic contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)\.env.*\.pem.*\.key' -Description 'sensitive text candidate contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)CE_INTENT_TO_ADD.*empty-blob' -Description 'real intent-to-add flag contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)trusted runtime API.*ambient `OS`' -Description 'trusted platform selection contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)Unicode control/Format.*per line.*per file.*globally.*64 KiB' -Description 'bounded escaped diagnostic contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)failure\s+prefix.*TSV header.*explicit LF.*64 KiB.*actual bytes' -Description 'complete UTF-8 finding payload contract'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)portable real-Git.*merge-conflict.*full PowerShell 7 suite.*Ubuntu' -Description 'POSIX real-Git self-test contract'
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?i)fails? closed' -Description 'fail-closed scanner boundary'
 Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'validate-oss-readiness\.ps1' -Description 'OSS readiness validation in CI'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'scan-private-markers\.ps1' -Description 'private marker scan in CI'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'test-scan-private-markers\.ps1' -Description 'private marker scan self-test in CI'
+Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^    timeout-minutes:\s*10\s*$' -Description 'bounded validate job'
+Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Test private marker scan\s*\r?\n        shell:\s*pwsh\s*\r?\n        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'PowerShell 7 self-test binding'
+Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Test private marker scan \(Windows PowerShell 5\.1\)\s*\r?\n        shell:\s*powershell\s*\r?\n        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'Windows PowerShell 5.1 self-test binding'
+Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Scan for private markers\s*\r?\n        shell:\s*pwsh\s*\r?\n        run:\s*\./scripts/scan-private-markers\.ps1\s*$' -Description 'PowerShell 7 scanner binding'
+Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)^  validate-posix:\s*.*?runs-on:\s*ubuntu-latest\s*.*?run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'Ubuntu PowerShell full self-test binding'
 
 Test-SkillFrontmatter
 

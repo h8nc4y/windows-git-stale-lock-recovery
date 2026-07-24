@@ -234,8 +234,10 @@ equivalents beyond calling PowerShell from Git Bash.
   written discipline with copy-adaptable commands, not a tool.
 - No general git-internals tutorial; the focus is the sandboxed-git
   stale-lock case on Windows and its safe recovery.
-- No process killing, no sandbox disabling, no `.git` surgery beyond the
-  single lock file.
+- No process killing as a recovery action, no sandbox disabling, and no
+  `.git` surgery beyond the single lock file. The validation scanner may
+  terminate only a child process tree that it created and that exceeded its
+  finite deadline.
 
 ## Validation
 
@@ -271,7 +273,55 @@ git diff --check
 
 The GitHub Actions workflow runs the same validation, scan self-test,
 private-marker scan, and whitespace check on pull requests and pushes to
-`main`.
+`main`. The self-test runs separately under PowerShell 7 and Windows
+PowerShell 5.1 on Windows, plus PowerShell 7 on Ubuntu.
+
+For a Git repository, pass the exact repository root. The scanner rejects a
+repository subdirectory instead of silently changing scope. A missing or
+otherwise unresolvable root returns only the fixed
+`scan-root-resolution-failed` code; it never echoes the supplied path or raw
+PowerShell error framing. The scanner scans each stage-0 regular file from
+both its index blob and existing worktree path with distinct provenance.
+Sensitive text candidates include dotenv names
+(`.env`, `.env.*`, and `*.env`), PEM/key/config extensions, ordinary source
+and documentation extensions, and extensionless files; other extensions are
+skipped as binary-safe defaults. Malformed/conflict/intent-to-add/gitlink
+entries, symlinks, missing/reparse-point or concurrently changed worktree
+paths, path escape, and a tracked `.private-markers.local` fail closed.
+
+Git runs in bounded child processes with cloned, sanitized environments.
+Ambient `GIT_*`, user/system config, prompts, hooks, external attributes,
+replacement objects, and lazy fetches are disabled. Strict UTF-8 input,
+100,000-entry and 8,192 text-entry caps, 4 MiB per-file and 64 MiB total-text
+caps, a 16 MiB index-debug cap, stable double worktree snapshots, bounded
+pipe completion, process-tree cleanup, and `finally` cleanup limit failure
+impact. Non-Git fallback enumerates hidden files but explicitly excludes both
+nested `.git` directories and leaf `.git` control files.
+
+Index blobs are read through one bounded `git cat-file --batch` process, so a
+Git-backed scan uses at most six Git children: probe, initial stage listing,
+initial index-debug listing, optional batch read, final stage listing, and
+final index-debug listing. Both the initial/final `ls-files -z --stage` raw
+byte streams and the initial/final `ls-files -z --stage --debug` raw byte
+streams must match exactly. The stage records must also reconstruct exactly
+from each debug listing. This rejects staged add/replacement/deletion and
+flags-only mutation during the scan; real `git add -N` entries are detected
+from the `CE_INTENT_TO_ADD` flag even though Git uses the nonzero empty-blob
+object ID.
+
+Windows selection uses the runtime platform API rather than the ambient `OS`
+environment value. Windows creates each child suspended, assigns it to a
+kill-on-close Job, limits inherited handles to its three standard streams,
+and only then resumes it; POSIX descendant cleanup is best effort. See
+[SECURITY.md](SECURITY.md) for the detailed boundary and limits.
+
+Diagnostic paths escape Unicode control/Format characters (including bidi
+controls, zero-width characters, and U+2028/U+2029) before output. Findings
+are capped at 32 per line, 256 per file/provenance source, and 1,000 per scan;
+the complete finding payload—including the failure prefix, TSV header, rows,
+and explicit LF separators—is serialized once and capped at 64 KiB of actual
+UTF-8 bytes. It is emitted only after the whole bounded representation is
+ready.
 
 ## Related
 
@@ -294,7 +344,8 @@ For local-only private markers, create an untracked `.private-markers.local`
 file with one literal marker per line, or set
 `WINDOWS_GIT_STALE_LOCK_RECOVERY_PRIVATE_MARKERS` with newline-separated
 markers. The scanner reads these values but does not print the matched
-marker.
+marker. Each source is capped at 64 KiB, with at most 100 non-comment markers
+and 1,024 characters per marker.
 
 ## Security
 
