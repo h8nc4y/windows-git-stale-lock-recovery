@@ -8,6 +8,9 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Split the hosted Windows PowerShell 5.1 full self-test into its own bounded
+  job and added opt-in anonymous phase markers, after the combined Windows job
+  twice reached its deadline without identifying the stalled fixture.
 - Hardened git-tracked private-marker enumeration against ambient `GIT_*`
   repository/index/object/config/trace redirection by using a cloned,
   sanitized child environment with isolated config, prompt, hooks,

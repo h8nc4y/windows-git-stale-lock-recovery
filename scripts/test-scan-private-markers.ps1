@@ -34,6 +34,19 @@ function Add-Failure {
     $failures.Add($Message) | Out-Null
 }
 
+$script:selfTestProgressEnabled = (
+    [Environment]::GetEnvironmentVariable(
+        'PRIVATE_MARKER_SELFTEST_PROGRESS') -eq '1')
+
+function Write-SelfTestProgress {
+    param([string]$Phase)
+
+    if ($script:selfTestProgressEnabled) {
+        # Hosted runner の長時間fixtureを匿名phase codeだけで診断する。
+        [Console]::Out.WriteLine("SELFTEST_PROGRESS:$Phase")
+    }
+}
+
 # scanner が親 process の Env: を直接変更せず、未知 GIT_* も child clone
 # から除外する境界を source invariant として固定する。
 $scannerSource = Get-Content -LiteralPath $scanner -Raw
@@ -1116,6 +1129,8 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("windows-git-stale-lock
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 
 try {
+    Write-SelfTestProgress -Phase 'basic-and-output-bounds'
+
     # 存在しないhostile pathでも生pathやPowerShell error framingを返さず、
     # 小さいraw stdoutだけへ固定codeを1行出力する。
     $hostileMissingPath = Join-Path $tempRoot (
@@ -1538,6 +1553,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
         Add-Failure "Expected non-Git text file to fail at the byte cap. Output: $($oversizedTextResult.Output.Trim())"
     }
 
+    Write-SelfTestProgress -Phase 'fallback-boundaries'
+
     # non-Git fallback配下のnested `.git` directoryとleaf `.git` fileは、
     # markerを含んでもGit control metadataとして明示的に除外する。
     $nestedGitRoot = Join-Path $tempRoot 'nested-git-fallback'
@@ -1566,6 +1583,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
     }
 
     if ($script:isWindowsRuntime) {
+        Write-SelfTestProgress -Phase 'windows-containment'
+
         # native C# wrapperはWindows containment/env/mutation専用。POSIXでは
         # 後段のportable real-Git fixturesだけを実行し、cscへ依存しない。
         # 敵対的 GIT_* があっても requested repo の tracked 列挙を維持し、
@@ -1729,6 +1748,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
         Remove-Item -LiteralPath $wrapperReport
     }
 
+    Write-SelfTestProgress -Phase 'windows-command-budget'
+
     # text file 数を増やしても Git child は probe/list/debug/batch/
     # final-list/final-debug の6回だけであることを実 invocation 列で固定する。
     $boundedInvocationRepo = Join-Path $adversarialRoot 'bounded-invocations'
@@ -1842,6 +1863,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
                 -ErrorAction SilentlyContinue
         }
     }
+
+    Write-SelfTestProgress -Phase 'windows-mutation-detection'
 
     # 2回目の ls-files 直前に wrapper が実際の index へ add と OID replace
     # を行う。最終 raw snapshot が初回と違えば、結果を返さず fail closed にする。
@@ -2062,6 +2085,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
         Remove-Item -LiteralPath $caseReport -ErrorAction SilentlyContinue
     }
 
+    Write-SelfTestProgress -Phase 'windows-timeout-containment'
+
     # scanner 内部の Git child が孫に pipe を保持させても、15秒 deadline
     # で tree kill し、外側 self-test timeout には到達しない。
     $pipeReport = Join-Path $artifactRoot 'pipe-report.txt'
@@ -2130,6 +2155,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
             Add-Failure 'Expected scanner child temporary artifacts to be removed in finally cleanup.'
         }
     }
+
+    Write-SelfTestProgress -Phase 'portable-real-git'
 
     # repo 内 subdir は曖昧な partial scan にせず、root contract 違反として拒否する。
     $subdirectoryResult = Invoke-Scanner -ScanPath (Join-Path $root 'scripts')
@@ -2348,6 +2375,8 @@ You can also write C:\Users\<name>\project to describe a user directory.
         -Arguments @('replace', '-d', $markerObjectId) `
         -IsolatedHome $indexUnionHome)
 
+    Write-SelfTestProgress -Phase 'git-object-boundaries'
+
     # partial clone の欠損 blob はローカル promisor remote にだけ残す。
     # scanner が lazy fetch しなければ generic read failure のまま object は復元されず、
     # 誤って fetch すれば marker 検出と loose object の再生成で回帰を観測できる。
@@ -2533,6 +2562,7 @@ You can also write C:\Users\<name>\project to describe a user directory.
     }
 }
 finally {
+    Write-SelfTestProgress -Phase 'final-cleanup'
     if (Test-Path -LiteralPath $tempRoot) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force
     }
@@ -2546,5 +2576,6 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
+Write-SelfTestProgress -Phase 'complete'
 Write-Host 'Private marker scan self-test passed.'
 exit 0

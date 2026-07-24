@@ -274,7 +274,13 @@ git diff --check
 The GitHub Actions workflow runs the same validation, scan self-test,
 private-marker scan, and whitespace check on pull requests and pushes to
 `main`. The self-test runs separately under PowerShell 7 and Windows
-PowerShell 5.1 on Windows, plus PowerShell 7 on Ubuntu.
+PowerShell 5.1 on Windows, plus PowerShell 7 on Ubuntu. The full Windows
+PowerShell 5.1 suite has its own 35-minute job deadline so it cannot consume
+the faster PowerShell 7 job budget. That dedicated CI job opts into fixed
+`SELFTEST_PROGRESS:<phase>` codes, which identify the adversarial phase that
+has started most recently without printing paths, fixture content, or
+environment values. Local callers can opt in with the same environment flag
+when diagnosing a bounded self-test run.
 
 For a Git repository, pass the exact repository root. The scanner rejects a
 repository subdirectory instead of silently changing scope. A missing or

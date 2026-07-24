@@ -72,6 +72,248 @@ function Assert-Utf8Bom {
     }
 }
 
+function Assert-SelfTestProgressContract {
+    $relativePath = 'scripts/test-scan-private-markers.ps1'
+    $filePath = Get-RepoFilePath -RelativePath $relativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+
+    # phase名を動的な値から組み立てられると、CI logへpathや環境値が
+    # 混入し得る。function内部を除く全callをASTで列挙し、固定literalと
+    # 実行順を公開contractとして固定する。
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $filePath,
+        [ref]$tokens,
+        [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) {
+        Add-Failure "$relativePath must parse before checking progress markers."
+        return
+    }
+
+    $progressCalls = @($ast.FindAll({
+        param($node)
+
+        if ($node -isnot [System.Management.Automation.Language.CommandAst] -or
+            $node.GetCommandName() -ne 'Write-SelfTestProgress') {
+            return $false
+        }
+
+        $parent = $node.Parent
+        while ($null -ne $parent) {
+            if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                return $false
+            }
+            $parent = $parent.Parent
+        }
+        return $true
+    }, $true))
+
+    $expectedPhases = @(
+        'basic-and-output-bounds',
+        'fallback-boundaries',
+        'windows-containment',
+        'windows-command-budget',
+        'windows-mutation-detection',
+        'windows-timeout-containment',
+        'portable-real-git',
+        'git-object-boundaries',
+        'final-cleanup',
+        'complete'
+    )
+    $actualPhases = New-Object System.Collections.Generic.List[string]
+
+    foreach ($call in $progressCalls) {
+        $elements = @($call.CommandElements)
+        if ($elements.Count -ne 3 -or
+            $elements[1] -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+            $elements[1].ParameterName -ne 'Phase' -or
+            $elements[2] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            Add-Failure "$relativePath progress calls must use one fixed -Phase literal."
+            return
+        }
+        $actualPhases.Add($elements[2].Value) | Out-Null
+    }
+
+    if ($actualPhases.Count -ne $expectedPhases.Count) {
+        Add-Failure "$relativePath must declare exactly $($expectedPhases.Count) top-level progress phases."
+        return
+    }
+    for ($index = 0; $index -lt $expectedPhases.Count; $index++) {
+        if ($actualPhases[$index] -ne $expectedPhases[$index]) {
+            Add-Failure "$relativePath progress phase $index must be '$($expectedPhases[$index])'."
+        }
+    }
+
+    # final-cleanupは削除処理が停滞する前に出し、completeはcleanup完了かつ
+    # failure=0の成功経路だけで出す。末尾構造も固定して誤診を防ぐ。
+    $source = Get-Content -LiteralPath $filePath -Raw
+    $terminalPattern = (
+        '(?ms)finally\s*\{\s*' +
+        'Write-SelfTestProgress\s+-Phase\s+''final-cleanup''\s*' +
+        '.*?\}\s*if\s*\(\$failures\.Count\s+-gt\s+0\)\s*\{' +
+        '.*?exit\s+1\s*\}\s*' +
+        'Write-SelfTestProgress\s+-Phase\s+''complete''\s*' +
+        'Write-Host\s+''Private marker scan self-test passed\.''')
+    if ($source -notmatch $terminalPattern) {
+        Add-Failure "$relativePath must mark final cleanup before cleanup and complete only on success."
+    }
+}
+
+function Assert-TextMatchCount {
+    param(
+        [string]$Text,
+        [string]$Pattern,
+        [int]$ExpectedCount,
+        [string]$Description
+    )
+
+    $actualCount = [regex]::Matches($Text, $Pattern).Count
+    if ($actualCount -ne $ExpectedCount) {
+        Add-Failure "$Description has $actualCount matches, expected $ExpectedCount."
+    }
+}
+
+function Assert-WorkflowJobShape {
+    param(
+        [string]$Block,
+        [string]$JobName,
+        [int]$ExpectedStepCount,
+        [int]$ExpectedShellCount,
+        [int]$ExpectedRunCount,
+        [int]$ExpectedEnvCount
+    )
+
+    # expected行だけを数えると、重複keyや無名stepを追加しても見逃す。
+    # YAMLのindent別に全key/全list itemを数え、許可したshape以外を拒否する。
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^    name:\s*' -ExpectedCount 1 -Description "$JobName name key"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^    timeout-minutes:\s*' -ExpectedCount 1 -Description "$JobName timeout key"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^    runs-on:\s*' -ExpectedCount 1 -Description "$JobName runs-on key"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^    steps:\s*' -ExpectedCount 1 -Description "$JobName steps key"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^    (?![ #\r\n]).+$' -ExpectedCount 4 -Description "$JobName total job-level entries"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^      -\s+' -ExpectedCount $ExpectedStepCount -Description "$JobName total step items"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^      - name:\s*' -ExpectedCount $ExpectedStepCount -Description "$JobName named step items"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^        uses:\s*' -ExpectedCount 1 -Description "$JobName total uses keys"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^        shell:\s*' -ExpectedCount $ExpectedShellCount -Description "$JobName total shell keys"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^        run:\s*' -ExpectedCount $ExpectedRunCount -Description "$JobName total run keys"
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^        env:\s*' -ExpectedCount $ExpectedEnvCount -Description "$JobName total env keys"
+    $expectedStepPropertyCount = (
+        1 +
+        $ExpectedShellCount +
+        $ExpectedRunCount +
+        $ExpectedEnvCount)
+    Assert-TextMatchCount -Text $Block -Pattern '(?m)^        (?![ #\r\n]).+$' -ExpectedCount $expectedStepPropertyCount -Description "$JobName total step-level entries"
+}
+
+function Assert-WorkflowContracts {
+    $relativePath = '.github/workflows/validate.yml'
+    $filePath = Get-RepoFilePath -RelativePath $relativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+
+    # file全体の件数だけでは、stepを別jobへ移しても合格し得る。jobs配下を
+    # 2-space job境界で分割し、runner/deadline/action/shell/runの所有者を固定する。
+    $source = Get-Content -LiteralPath $filePath -Raw
+    $jobsMatch = [regex]::Match(
+        $source,
+        '(?ms)^jobs:\s*\r?\n(?<jobs>.*)\z')
+    if (-not $jobsMatch.Success) {
+        Add-Failure "$relativePath must contain a terminal jobs mapping."
+        return
+    }
+
+    $jobMatches = [regex]::Matches(
+        $jobsMatch.Groups['jobs'].Value,
+        '(?ms)^  (?<name>[A-Za-z0-9_-]+):\s*\r?\n' +
+        '(?<body>.*?)(?=^  [A-Za-z0-9_-]+:\s*(?:\r?\n|\z)|\z)')
+    $expectedJobNames = @(
+        'validate',
+        'validate-windows-powershell',
+        'validate-posix'
+    )
+    $workflowShapeValid = $true
+    if ($jobMatches.Count -ne $expectedJobNames.Count) {
+        Add-Failure "$relativePath must declare exactly three validation jobs."
+        $workflowShapeValid = $false
+    }
+
+    $jobBlocks = @{}
+    foreach ($jobMatch in $jobMatches) {
+        $jobName = $jobMatch.Groups['name'].Value
+        if ($jobBlocks.ContainsKey($jobName)) {
+            Add-Failure "$relativePath declares duplicate job: $jobName"
+            $workflowShapeValid = $false
+            continue
+        }
+        $jobBlocks[$jobName] = $jobMatch.Value
+    }
+    foreach ($expectedJobName in $expectedJobNames) {
+        if (-not $jobBlocks.ContainsKey($expectedJobName)) {
+            Add-Failure "$relativePath is missing validation job: $expectedJobName"
+            $workflowShapeValid = $false
+        }
+    }
+    if (-not $workflowShapeValid) {
+        return
+    }
+
+    $checkoutPattern = (
+        '(?m)^        uses:\s*actions/checkout@' +
+        'fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' +
+        '(?:\s+#.*)?\s*$')
+    $pwshReadinessPattern = (
+        '(?m)^      - name:\s*Validate OSS readiness\s*\r?\n' +
+        '        shell:\s*pwsh\s*\r?\n' +
+        '        run:\s*\./scripts/validate-oss-readiness\.ps1\s*$')
+    $pwshSelfTestPattern = (
+        '(?m)^      - name:\s*Test private marker scan\s*\r?\n' +
+        '        shell:\s*pwsh\s*\r?\n' +
+        '        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$')
+    $pwshScannerPattern = (
+        '(?m)^      - name:\s*Scan for private markers\s*\r?\n' +
+        '        shell:\s*pwsh\s*\r?\n' +
+        '        run:\s*\./scripts/scan-private-markers\.ps1\s*$')
+    $pwshWhitespacePattern = (
+        '(?ms)^      - name:\s*Check whitespace\s*\r?\n' +
+        '(?:(?!^      - name:).)*?' +
+        '^        shell:\s*pwsh\s*\r?\n' +
+        '(?:(?!^      - name:).)*?' +
+        '^        run:\s*git diff-tree --check ' +
+        '4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD\s*$')
+
+    foreach ($jobName in @('validate', 'validate-posix')) {
+        $block = $jobBlocks[$jobName]
+        $runner = if ($jobName -eq 'validate') {
+            'windows-latest'
+        }
+        else {
+            'ubuntu-latest'
+        }
+        Assert-TextMatchCount -Text $block -Pattern '(?m)^    timeout-minutes:\s*10\s*$' -ExpectedCount 1 -Description "$jobName 10-minute deadline"
+        Assert-TextMatchCount -Text $block -Pattern "(?m)^    runs-on:\s*$([regex]::Escape($runner))\s*$" -ExpectedCount 1 -Description "$jobName runner"
+        Assert-TextMatchCount -Text $block -Pattern $checkoutPattern -ExpectedCount 1 -Description "$jobName immutable checkout"
+        Assert-TextMatchCount -Text $block -Pattern $pwshReadinessPattern -ExpectedCount 1 -Description "$jobName readiness step"
+        Assert-TextMatchCount -Text $block -Pattern $pwshSelfTestPattern -ExpectedCount 1 -Description "$jobName self-test step"
+        Assert-TextMatchCount -Text $block -Pattern $pwshScannerPattern -ExpectedCount 1 -Description "$jobName scanner step"
+        Assert-TextMatchCount -Text $block -Pattern $pwshWhitespacePattern -ExpectedCount 1 -Description "$jobName whitespace step"
+        Assert-TextMatchCount -Text $block -Pattern '(?m)^        shell:\s*pwsh\s*$' -ExpectedCount 4 -Description "$jobName pwsh shell ownership"
+        Assert-WorkflowJobShape -Block $block -JobName $jobName -ExpectedStepCount 5 -ExpectedShellCount 4 -ExpectedRunCount 4 -ExpectedEnvCount 0
+    }
+
+    $windowsPowerShellBlock = $jobBlocks['validate-windows-powershell']
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^    timeout-minutes:\s*35\s*$' -ExpectedCount 1 -Description 'Windows PowerShell 5.1 deadline'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^    runs-on:\s*windows-latest\s*$' -ExpectedCount 1 -Description 'Windows PowerShell 5.1 runner'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern $checkoutPattern -ExpectedCount 1 -Description 'Windows PowerShell 5.1 immutable checkout'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^      - name:\s*Validate OSS readiness\s*\r?\n        shell:\s*powershell\s*\r?\n        run:\s*\./scripts/validate-oss-readiness\.ps1\s*$' -ExpectedCount 1 -Description 'Windows PowerShell 5.1 readiness step'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^      - name:\s*Test private marker scan \(Windows PowerShell 5\.1\)\s*\r?\n        shell:\s*powershell\s*\r?\n        env:\s*\r?\n          PRIVATE_MARKER_SELFTEST_PROGRESS:\s*''1''\s*\r?\n        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -ExpectedCount 1 -Description 'Windows PowerShell 5.1 self-test step'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^      - name:\s*Scan for private markers\s*\r?\n        shell:\s*powershell\s*\r?\n        run:\s*\./scripts/scan-private-markers\.ps1\s*$' -ExpectedCount 1 -Description 'Windows PowerShell 5.1 scanner step'
+    Assert-TextMatchCount -Text $windowsPowerShellBlock -Pattern '(?m)^        shell:\s*powershell\s*$' -ExpectedCount 3 -Description 'Windows PowerShell 5.1 shell ownership'
+    Assert-WorkflowJobShape -Block $windowsPowerShellBlock -JobName 'Windows PowerShell 5.1' -ExpectedStepCount 4 -ExpectedShellCount 3 -ExpectedRunCount 3 -ExpectedEnvCount 1
+}
+
 function Test-SkillFrontmatter {
     $skillPath = Get-RepoFilePath -RelativePath 'SKILL.md'
     if (-not (Test-Path -LiteralPath $skillPath -PathType Leaf)) {
@@ -167,14 +409,10 @@ Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.loca
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?i)fails? closed' -Description 'fail-closed scanner boundary'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern 'validate-oss-readiness\.ps1' -Description 'OSS readiness validation in CI'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^    timeout-minutes:\s*10\s*$' -Description 'bounded validate job'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Test private marker scan\s*\r?\n        shell:\s*pwsh\s*\r?\n        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'PowerShell 7 self-test binding'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Test private marker scan \(Windows PowerShell 5\.1\)\s*\r?\n        shell:\s*powershell\s*\r?\n        run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'Windows PowerShell 5.1 self-test binding'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?m)^      - name:\s*Scan for private markers\s*\r?\n        shell:\s*pwsh\s*\r?\n        run:\s*\./scripts/scan-private-markers\.ps1\s*$' -Description 'PowerShell 7 scanner binding'
-Assert-FileContains -RelativePath '.github/workflows/validate.yml' -Pattern '(?ms)^  validate-posix:\s*.*?runs-on:\s*ubuntu-latest\s*.*?run:\s*\./scripts/test-scan-private-markers\.ps1\s*$' -Description 'Ubuntu PowerShell full self-test binding'
 
 Test-SkillFrontmatter
+Assert-SelfTestProgressContract
+Assert-WorkflowContracts
 
 if ($failures.Count -gt 0) {
     Write-Host 'OSS readiness validation failed:'
