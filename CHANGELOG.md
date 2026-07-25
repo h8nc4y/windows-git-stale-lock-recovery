@@ -8,6 +8,19 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Disabled the module-analysis cache at all PowerShell validation/scanner
+  entrypoints with Microsoft's platform null-device values (`NUL` on Windows,
+  `/dev/null` elsewhere), then relaunched the same host once so the child
+  inherits the setting before startup. The pre-overwrite marker/path pair
+  prevents a marker-only ambient value from skipping relaunch. The launcher
+  creates and deletes no temporary cache object, eliminating physical-alias
+  and cleanup races.
+- Added synthetic regressions for a relative
+  `Microsoft/Windows/PowerShell/ModuleAnalysisCache` working-directory leak
+  plus exact raw stdout/stderr bytes, nonzero exit propagation, edge
+  arguments, same-host/one-relaunch behavior, missing-helper failure, explicit
+  target `TEMP`, and junction/symlink aliases. The artifact is intentionally
+  not ignored, so recurrence stays visible.
 - Split the hosted Windows PowerShell 5.1 full self-test into its own bounded
   job and added opt-in anonymous phase markers, after the combined Windows job
   twice reached its deadline without identifying the stalled fixture.

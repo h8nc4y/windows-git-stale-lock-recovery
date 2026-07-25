@@ -66,6 +66,17 @@ pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
 
+The three entry scripts point their current parent at the platform null device
+in an initial .NET-only phase before cmdlet or module discovery, then relaunch
+the same host once with
+`PSModuleAnalysisCachePath=NUL` on Windows or `/dev/null` on non-Windows.
+Do not bypass this bootstrap in tests. Keep the exact stdout/stderr byte,
+nonzero exit-code, edge-argument, same-host, one-relaunch, missing-helper,
+explicit-target `TEMP`, and junction/symlink controls passing. The cache
+boundary must not create or clean a temporary filesystem object. Do not add
+`Microsoft/` to `.gitignore`, because that would hide a recurrence instead of
+fixing its source.
+
 The private-marker self-test always launches scanner children with the same
 PowerShell host that launched the self-test. Running the `powershell` and
 `pwsh` command sets above therefore provides two distinct compatibility

@@ -5,8 +5,86 @@ param(
     [int]$GitCommandTimeoutSeconds = 15
 )
 
-Set-StrictMode -Version Latest
+# ambient markerだけで再実行をskipさせない。上書き前の marker/sink pair を
+# .NETだけでcaptureし、childが起動前から正しいpairを持つ場合だけ受理する。
+$moduleCacheBootstrapOriginalMarker =
+    [Environment]::GetEnvironmentVariable(
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
+$moduleCacheBootstrapOriginalPath =
+    [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath')
+$moduleCacheBootstrapSink = if (
+    [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+) {
+    'NUL'
+}
+else {
+    '/dev/null'
+}
+$moduleCacheBootstrapAlreadyIsolated = (
+    $moduleCacheBootstrapOriginalMarker -ceq '1' -and
+    [string]::Equals(
+        $moduleCacheBootstrapOriginalPath,
+        $moduleCacheBootstrapSink,
+        $(if (
+                [Environment]::OSVersion.Platform -eq
+                    [PlatformID]::Win32NT
+            ) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            })))
+
+# 既に起動した親hostのbackground writerにも、最初の処理でnull deviceを渡す。
+[Environment]::SetEnvironmentVariable(
+    'PSModuleAnalysisCachePath',
+    $moduleCacheBootstrapSink,
+    'Process')
+
 $ErrorActionPreference = 'Stop'
+
+# PowerShell 5.1 が長時間scan中にcwdへ ModuleAnalysisCache を書かないよう、
+# module/cmdlet discovery より先にnull-device設定済みの同一host childへ移す。
+$moduleCacheScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($moduleCacheScriptRoot)) {
+    $moduleCacheScriptRoot = [IO.Path]::GetDirectoryName(
+        $MyInvocation.MyCommand.Path)
+}
+$moduleCacheIsolationPath = [IO.Path]::Combine(
+    $moduleCacheScriptRoot,
+    'module-analysis-cache-isolation.ps1')
+if (-not [IO.File]::Exists($moduleCacheIsolationPath)) {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+try {
+    . $moduleCacheIsolationPath
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+$moduleCacheArguments = @(
+    '-GitCommandTimeoutSeconds',
+    [string]$GitCommandTimeoutSeconds)
+if (-not [string]::IsNullOrWhiteSpace($Path)) {
+    $moduleCacheArguments += @('-Path', $Path)
+}
+try {
+    Initialize-ModuleAnalysisCacheIsolation `
+        -ScriptPath $MyInvocation.MyCommand.Path `
+        -ScriptArguments $moduleCacheArguments `
+        -BootstrapAlreadyIsolated $moduleCacheBootstrapAlreadyIsolated
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+
+Set-StrictMode -Version Latest
 $script:isWindowsRuntime = (
     [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 
@@ -1382,13 +1460,18 @@ function New-SanitizedGitEnvironment {
         'HOME',
         'USERPROFILE',
         'XDG_CONFIG_HOME',
+        'PSModuleAnalysisCachePath',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_TOKEN',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ROOT',
         'SSH_ASKPASS',
         'GCM_INTERACTIVE',
         'GCM_GUI_PROMPT'
     )
     foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
         $name = [string]$entry.Key
-        # 未知の将来変数も含め、ambient GIT_* は allowlist 方式で全て落とす。
+        # 未知のambient GIT_*に加え、PowerShell launcherだけが使う隔離情報も
+        # native Git childへ渡さない。旧owner名も互換上の境界として除外する。
         if ($name -match '^GIT_' -or $removedNames -contains $name) {
             continue
         }

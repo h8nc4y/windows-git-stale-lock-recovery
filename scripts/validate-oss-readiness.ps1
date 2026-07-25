@@ -3,8 +3,82 @@ param(
     [string]$Path = ''
 )
 
-Set-StrictMode -Version Latest
+$moduleCacheBootstrapOriginalMarker =
+    [Environment]::GetEnvironmentVariable(
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
+$moduleCacheBootstrapOriginalPath =
+    [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath')
+$moduleCacheBootstrapSink = if (
+    [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+) {
+    'NUL'
+}
+else {
+    '/dev/null'
+}
+$moduleCacheBootstrapAlreadyIsolated = (
+    $moduleCacheBootstrapOriginalMarker -ceq '1' -and
+    [string]::Equals(
+        $moduleCacheBootstrapOriginalPath,
+        $moduleCacheBootstrapSink,
+        $(if (
+                [Environment]::OSVersion.Platform -eq
+                    [PlatformID]::Win32NT
+            ) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            })))
+
+# readiness親hostの非同期cache writerを最初の処理でnull deviceへ向ける。
+[Environment]::SetEnvironmentVariable(
+    'PSModuleAnalysisCachePath',
+    $moduleCacheBootstrapSink,
+    'Process')
+
 $ErrorActionPreference = 'Stop'
+
+# readiness validatorも同じPowerShell entrypointであり、長時間実行時の
+# ModuleAnalysisCacheをnull deviceへ無効化してから検証を開始する。
+$moduleCacheScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($moduleCacheScriptRoot)) {
+    $moduleCacheScriptRoot = [IO.Path]::GetDirectoryName(
+        $MyInvocation.MyCommand.Path)
+}
+$moduleCacheIsolationPath = [IO.Path]::Combine(
+    $moduleCacheScriptRoot,
+    'module-analysis-cache-isolation.ps1')
+if (-not [IO.File]::Exists($moduleCacheIsolationPath)) {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+try {
+    . $moduleCacheIsolationPath
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+$moduleCacheArguments = @()
+if (-not [string]::IsNullOrWhiteSpace($Path)) {
+    $moduleCacheArguments += @('-Path', $Path)
+}
+try {
+    Initialize-ModuleAnalysisCacheIsolation `
+        -ScriptPath $MyInvocation.MyCommand.Path `
+        -ScriptArguments $moduleCacheArguments `
+        -BootstrapAlreadyIsolated $moduleCacheBootstrapAlreadyIsolated
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+
+Set-StrictMode -Version Latest
 
 $scriptRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
@@ -53,6 +127,25 @@ function Assert-FileContains {
     $content = Get-Content -LiteralPath $filePath -Raw
     if ($content -notmatch $Pattern) {
         Add-Failure "$RelativePath is missing: $Description"
+    }
+}
+
+function Assert-FileOmits {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw
+    if ($content -match $Pattern) {
+        Add-Failure "$RelativePath still contains: $Description"
     }
 }
 
@@ -112,6 +205,7 @@ function Assert-SelfTestProgressContract {
     }, $true))
 
     $expectedPhases = @(
+        'module-cache-isolation',
         'basic-and-output-bounds',
         'fallback-boundaries',
         'windows-containment',
@@ -367,9 +461,11 @@ $requiredFiles = @(
     'SECURITY.md',
     'SKILL.md',
     'docs/SKILL.ja.md',
+    'docs/module-analysis-cache-isolation.md',
     'examples/five-point-check-checklist.md',
     'examples/single-lock-recovery-walkthrough.md',
     'examples/post-merge-local-sync-recipe.md',
+    'scripts/module-analysis-cache-isolation.ps1',
     'scripts/scan-private-markers.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
@@ -380,6 +476,7 @@ foreach ($requiredFile in $requiredFiles) {
 }
 
 foreach ($powerShellScript in @(
+    'scripts/module-analysis-cache-isolation.ps1',
     'scripts/scan-private-markers.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
@@ -394,6 +491,7 @@ Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Security' -De
 Assert-FileContains -RelativePath 'README.md' -Pattern 'CONTRIBUTING\.md' -Description 'link to CONTRIBUTING.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'SECURITY\.md' -Description 'link to SECURITY.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Description 'link to the Japanese skill version'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/module-analysis-cache-isolation\.md' -Description 'module cache isolation maintenance record'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)index blob.*worktree|worktree.*index blob' -Description 'index/worktree scanner provenance contract'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)cat-file --batch.*at most six Git children' -Description 'bounded batch Git child contract'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)ls-files -z --stage.*ls-files -z --stage --debug.*match exactly' -Description 'stable raw index and flags snapshot contract'
@@ -404,6 +502,20 @@ Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)CE_INTENT_TO_ADD.
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)trusted runtime API.*ambient `OS`' -Description 'trusted platform selection contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)Unicode control/Format.*per line.*per file.*globally.*64 KiB' -Description 'bounded escaped diagnostic contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)failure\s+prefix.*TSV header.*explicit LF.*64 KiB.*actual bytes' -Description 'complete UTF-8 finding payload contract'
+Assert-FileContains -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern "(?is)return 'NUL'.*return '/dev/null'.*PSModuleAnalysisCachePath" -Description 'official platform null-device module cache sink'
+Assert-FileContains -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern '(?is)ProcessStartInfo.*CreateNoWindow\s*=\s*\$false.*RedirectStandardOutput\s*=\s*\$false.*RedirectStandardError\s*=\s*\$false.*WaitForExit\(\).*ExitCode' -Description 'same-host raw stream and exit-code preserving launcher'
+Assert-FileOmits -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern '(?i)Remove-Item|File\]::Delete|Directory\]::Delete|CreateDirectory|GetTempPath' -Description 'temporary filesystem creation or cleanup API'
+foreach ($entryScript in @(
+    'scripts/scan-private-markers.ps1',
+    'scripts/test-scan-private-markers.ps1',
+    'scripts/validate-oss-readiness.ps1'
+)) {
+    Assert-FileContains `
+        -RelativePath $entryScript `
+        -Pattern '(?is)OriginalMarker.*OriginalPath.*AlreadyIsolated.*SetEnvironmentVariable.*module-analysis-cache-isolation\.ps1.*module-cache-bootstrap-failed.*Initialize-ModuleAnalysisCacheIsolation.*BootstrapAlreadyIsolated' `
+        -Description 'pre-overwrite marker/sink capture and fail-closed null-device bootstrap'
+}
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)module-cache-isolation.*OriginalMarker.*AlreadyIsolated.*0\.\.255.*255\.\.0.*ExitCode\s+-ne\s+23.*missing-helper.*explicit-target.*Junction.*SymbolicLink' -Description 'module cache marker-only, raw stream, bootstrap, explicit-target, and physical-alias regression fixtures'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)portable real-Git.*merge-conflict.*full PowerShell 7 suite.*Ubuntu' -Description 'POSIX real-Git self-test contract'
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'

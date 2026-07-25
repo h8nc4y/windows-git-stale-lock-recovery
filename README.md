@@ -257,6 +257,27 @@ pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
 
+Each PowerShell entrypoint performs a one-time bootstrap before its normal
+work. Its initial .NET-only phase points the current host at the platform null
+device before cmdlet or module discovery, then it relaunches the same PowerShell executable with
+`PSModuleAnalysisCachePath` already set to `NUL` on Windows or `/dev/null` on
+non-Windows. These are the cache-disable values documented by Microsoft.
+The entrypoint captures the ambient marker/path pair before overwriting the
+current parent; an isolated child is accepted only when both the launcher
+marker and exact platform sink already matched. No temporary cache file or directory is created, so
+ambient `TEMP` / `TMP`, physical path aliases, and cleanup races are outside
+the cache boundary.
+
+The launcher uses inherited OS standard handles instead of a PowerShell text
+pipeline. The self-test verifies all byte values on separate stdout/stderr
+streams, an exact nonzero child exit code, edge-case arguments, the same host
+executable, and exactly one relaunch. It also covers a relative ambient cache,
+missing-helper failure, an explicit scan target used as `TEMP`, and a
+junction/symlink alias to that target. No ignore rule hides the historical
+`Microsoft/Windows/PowerShell/ModuleAnalysisCache` artifact class, so a future
+regression remains visible. The design and current verification record are in
+[docs/module-analysis-cache-isolation.md](docs/module-analysis-cache-isolation.md).
+
 On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed:
 
 ```bash
