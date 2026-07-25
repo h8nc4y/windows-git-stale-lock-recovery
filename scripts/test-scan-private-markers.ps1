@@ -3,8 +3,82 @@ param(
     [string]$Path = ''
 )
 
-Set-StrictMode -Version Latest
+$moduleCacheBootstrapOriginalMarker =
+    [Environment]::GetEnvironmentVariable(
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
+$moduleCacheBootstrapOriginalPath =
+    [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath')
+$moduleCacheBootstrapSink = if (
+    [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+) {
+    'NUL'
+}
+else {
+    '/dev/null'
+}
+$moduleCacheBootstrapAlreadyIsolated = (
+    $moduleCacheBootstrapOriginalMarker -ceq '1' -and
+    [string]::Equals(
+        $moduleCacheBootstrapOriginalPath,
+        $moduleCacheBootstrapSink,
+        $(if (
+                [Environment]::OSVersion.Platform -eq
+                    [PlatformID]::Win32NT
+            ) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            })))
+
+# 親self-test hostの非同期cache writerを最初の処理でnull deviceへ向ける。
+[Environment]::SetEnvironmentVariable(
+    'PSModuleAnalysisCachePath',
+    $moduleCacheBootstrapSink,
+    'Process')
+
 $ErrorActionPreference = 'Stop'
+
+# self-test本体と全scanner childでnull deviceを共有し、呼出元cwdを
+# PowerShell 5.1 のbackground module analysis writerから隔離する。
+$moduleCacheScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($moduleCacheScriptRoot)) {
+    $moduleCacheScriptRoot = [IO.Path]::GetDirectoryName(
+        $MyInvocation.MyCommand.Path)
+}
+$moduleCacheIsolationPath = [IO.Path]::Combine(
+    $moduleCacheScriptRoot,
+    'module-analysis-cache-isolation.ps1')
+if (-not [IO.File]::Exists($moduleCacheIsolationPath)) {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+try {
+    . $moduleCacheIsolationPath
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+$moduleCacheArguments = @()
+if (-not [string]::IsNullOrWhiteSpace($Path)) {
+    $moduleCacheArguments += @('-Path', $Path)
+}
+try {
+    Initialize-ModuleAnalysisCacheIsolation `
+        -ScriptPath $MyInvocation.MyCommand.Path `
+        -ScriptArguments $moduleCacheArguments `
+        -BootstrapAlreadyIsolated $moduleCacheBootstrapAlreadyIsolated
+}
+catch {
+    [Console]::Error.WriteLine(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed')
+    exit 1
+}
+
+Set-StrictMode -Version Latest
 $script:isWindowsRuntime = (
     [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 
@@ -47,13 +121,20 @@ function Write-SelfTestProgress {
     }
 }
 
-# scanner が親 process の Env: を直接変更せず、未知 GIT_* も child clone
-# から除外する境界を source invariant として固定する。
+# scanner のprocess env変更は最初の固定cache sink 1件だけを許可する。
+# Env: providerやGIT_*直接変更は引き続き禁止し、native child cloneで隔離する。
 $scannerSource = Get-Content -LiteralPath $scanner -Raw
-if ($scannerSource -match '\[Environment\]::SetEnvironmentVariable' -or
+$scannerEnvironmentSetCalls = [regex]::Matches(
+    $scannerSource,
+    '\[Environment\]::SetEnvironmentVariable')
+$scannerAllowedCacheSetCalls = [regex]::Matches(
+    $scannerSource,
+    "(?is)\[Environment\]::SetEnvironmentVariable\(\s*'PSModuleAnalysisCachePath'\s*,\s*\`$moduleCacheBootstrapSink\s*,\s*'Process'\s*\)")
+if ($scannerEnvironmentSetCalls.Count -ne 1 -or
+    $scannerAllowedCacheSetCalls.Count -ne 1 -or
     $scannerSource -match '(?im)(?:Set-Item|Remove-Item)\s+(?:-LiteralPath\s+)?Env:' -or
     $scannerSource -match '(?im)\$env:GIT_[A-Z0-9_]*\s*=') {
-    Add-Failure 'Scanner must not mutate the parent process environment.'
+    Add-Failure 'Scanner may mutate process environment only for the fixed module cache bootstrap.'
 }
 if ($scannerSource -match '\$env:OS' -or
     $scannerSource -notmatch '\[Environment\]::OSVersion\.Platform') {
@@ -61,6 +142,16 @@ if ($scannerSource -match '\$env:OS' -or
 }
 if ($scannerSource -notmatch "\`$name\s+-match\s+'\^GIT_'") {
     Add-Failure 'Scanner must remove all ambient GIT_* names before applying its safe child allowlist.'
+}
+foreach ($launcherOnlyName in @(
+    'PSModuleAnalysisCachePath',
+    'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED',
+    'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_TOKEN',
+    'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ROOT'
+)) {
+    if ($scannerSource -notmatch [regex]::Escape("'$launcherOnlyName'")) {
+        Add-Failure "Scanner must remove launcher-only environment input before native Git: $launcherOnlyName"
+    }
 }
 if ($scannerSource -notmatch 'function\s+Test-HasGitControlEntryAtOrAbove' -or
     $scannerSource -notmatch 'Get-ChildItem\s+-LiteralPath\s+\$cursor\s+-Force') {
@@ -288,6 +379,7 @@ function Invoke-BoundedProcess {
         [string]$FilePath,
         [string[]]$ArgumentList,
         [hashtable]$Environment,
+        [string]$WorkingDirectory = '',
         [int]$TimeoutSeconds = 20,
         [int]$MaxStandardOutputBytes = (8 * 1024 * 1024),
         [int]$MaxStandardErrorBytes = (1024 * 1024)
@@ -308,6 +400,10 @@ function Invoke-BoundedProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        # cwd依存artifactの回帰fixtureだけ、所有temp内の明示cwdへ限定する。
+        $startInfo.WorkingDirectory = $WorkingDirectory
+    }
     $startInfo.EnvironmentVariables.Clear()
     foreach ($entry in $Environment.GetEnumerator()) {
         $startInfo.EnvironmentVariables[[string]$entry.Key] = [string]$entry.Value
@@ -462,6 +558,29 @@ function Invoke-BoundedProcess {
     }
 }
 
+function Test-ModuleCacheProbeContract {
+    param(
+        [object]$Result,
+        [byte[]]$ExpectedStandardOutput,
+        [byte[]]$ExpectedStandardError,
+        [bool]$ArtifactExists
+    )
+
+    # deadlineを広げてもtimeoutを成功扱いにしない。実process結果と高速な
+    # synthetic timeout fixtureの両方を同じ判定関数へ通す。
+    return (
+        $Result.ExitCode -eq 23 -and
+        -not $Result.TimedOut -and
+        [string]::IsNullOrEmpty($Result.OutputLimitExceeded) -and
+        [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+            $Result.StandardOutputBytes,
+            $ExpectedStandardOutput) -and
+        [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+            $Result.StandardErrorBytes,
+            $ExpectedStandardError) -and
+        -not $ArtifactExists)
+}
+
 function Assert-EnvironmentUnchanged {
     param(
         [hashtable]$Before,
@@ -504,8 +623,6 @@ function Invoke-Scanner {
         -BaseEnvironment (Get-ProcessEnvironmentClone) `
         -Overrides $EnvironmentOverrides `
         -RemoveNames $RemoveEnvironmentNames
-    # Windows PowerShell 5.1 の module analysis cache も fixture 内へ閉じ込める。
-    $environment['PSModuleAnalysisCachePath'] = Join-Path $tempRoot 'module-analysis-cache'
     return Invoke-BoundedProcess `
         -FilePath $powerShellExecutable `
         -ArgumentList $arguments `
@@ -1129,6 +1246,370 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("windows-git-stale-lock
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 
 try {
+    Write-SelfTestProgress -Phase 'module-cache-isolation'
+
+    $moduleCacheIsolationEnvironmentNames = @(
+        'PSModuleAnalysisCachePath',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_TOKEN',
+        'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ROOT')
+
+    # 未隔離hostを所有temp cwdから起動し、同じ executable の child が1回だけ
+    # 再実行されること、全byte stream・任意exit・edge引数を変換しないことを測る。
+    $cacheProbeRoot = Join-Path $tempRoot 'module-cache-isolation'
+    $cacheProbeWorkingDirectory = Join-Path $cacheProbeRoot 'working-directory'
+    New-Item -ItemType Directory -Path $cacheProbeRoot, $cacheProbeWorkingDirectory |
+        Out-Null
+    $cacheProbeScript = Join-Path $cacheProbeRoot 'cache-probe.ps1'
+    $cacheProbeReport = Join-Path $cacheProbeRoot 'cache-probe.tsv'
+    Set-Content -LiteralPath $cacheProbeScript -Encoding UTF8 -Value @'
+[CmdletBinding()]
+param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ProbeArguments = @()
+)
+
+$bootstrapOriginalMarker = [Environment]::GetEnvironmentVariable(
+    'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
+$bootstrapOriginalPath = [Environment]::GetEnvironmentVariable(
+    'PSModuleAnalysisCachePath')
+$bootstrapSink = if (
+    [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+) {
+    'NUL'
+}
+else {
+    '/dev/null'
+}
+$bootstrapAlreadyIsolated = (
+    $bootstrapOriginalMarker -ceq '1' -and
+    [string]::Equals(
+        $bootstrapOriginalPath,
+        $bootstrapSink,
+        $(if (
+                [Environment]::OSVersion.Platform -eq
+                    [PlatformID]::Win32NT
+            ) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            })))
+[Environment]::SetEnvironmentVariable(
+    'PSModuleAnalysisCachePath',
+    $bootstrapSink,
+    'Process')
+
+$helperPath = [Environment]::GetEnvironmentVariable(
+    'PRIVATE_MARKER_MODULE_CACHE_HELPER_PATH')
+$reportPath = [Environment]::GetEnvironmentVariable(
+    'PRIVATE_MARKER_MODULE_CACHE_REPORT_PATH')
+$cachePath = [Environment]::GetEnvironmentVariable(
+    'PSModuleAnalysisCachePath')
+$process = [Diagnostics.Process]::GetCurrentProcess()
+try {
+    $hostPath = $process.MainModule.FileName
+}
+finally {
+    $process.Dispose()
+}
+$role = if ($bootstrapAlreadyIsolated) { 'child' } else { 'parent' }
+$encodedArguments = @()
+foreach ($argument in $ProbeArguments) {
+    $encodedArguments += [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($argument))
+}
+[IO.File]::AppendAllText(
+    $reportPath,
+    ($role, [string]$PID, $hostPath, $cachePath,
+        ($encodedArguments -join ',') -join [char]9) + [char]10,
+    (New-Object Text.UTF8Encoding($false)))
+
+. $helperPath
+Initialize-ModuleAnalysisCacheIsolation `
+    -ScriptPath $MyInvocation.MyCommand.Path `
+    -ScriptArguments $ProbeArguments `
+    -BootstrapAlreadyIsolated $bootstrapAlreadyIsolated
+
+[IO.File]::AppendAllText(
+    $reportPath,
+    ('after', [string]$PID, $hostPath,
+        [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath'),
+        ($encodedArguments -join ',') -join [char]9) + [char]10,
+    (New-Object Text.UTF8Encoding($false)))
+
+# NUL、invalid UTF-8、CR/LFを含む全byte値をOS streamへ直接書く。
+[byte[]]$stdoutBytes = [byte[]](0..255)
+[byte[]]$stderrBytes = [byte[]](255..0)
+$stdout = [Console]::OpenStandardOutput()
+$stderr = [Console]::OpenStandardError()
+try {
+    $stdout.Write($stdoutBytes, 0, $stdoutBytes.Length)
+    $stdout.Flush()
+    $stderr.Write($stderrBytes, 0, $stderrBytes.Length)
+    $stderr.Flush()
+}
+finally {
+    $stdout.Dispose()
+    $stderr.Dispose()
+}
+exit 23
+'@
+    $cacheProbeEdgeArguments = @(
+        'plain',
+        'space value',
+        'quote"value',
+        'trailing\',
+        'slashes\\\"quoted',
+        '',
+        'semi;colon',
+        '$literal')
+    $expectedEncodedArguments = @(
+        foreach ($argument in $cacheProbeEdgeArguments) {
+            [Convert]::ToBase64String(
+                [Text.Encoding]::UTF8.GetBytes($argument))
+        }) -join ','
+    $cacheProbeEnvironment = New-ChildEnvironment `
+        -BaseEnvironment (Get-ProcessEnvironmentClone) `
+        -RemoveNames $moduleCacheIsolationEnvironmentNames `
+        -Overrides @{
+            PSModuleAnalysisCachePath =
+                'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+            WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED = '1'
+            PRIVATE_MARKER_MODULE_CACHE_HELPER_PATH =
+                $moduleCacheIsolationPath
+            PRIVATE_MARKER_MODULE_CACHE_REPORT_PATH =
+                $cacheProbeReport
+        }
+    $cacheProbeArguments = @('-NoProfile')
+    if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+        $cacheProbeArguments += @('-ExecutionPolicy', 'Bypass')
+    }
+    $cacheProbeArguments += @(
+        '-File',
+        $cacheProbeScript) + $cacheProbeEdgeArguments
+    $cacheProbeResult = Invoke-BoundedProcess `
+        -FilePath $powerShellExecutable `
+        -ArgumentList $cacheProbeArguments `
+        -Environment $cacheProbeEnvironment `
+        -WorkingDirectory $cacheProbeWorkingDirectory `
+        -TimeoutSeconds 120
+    [byte[]]$expectedCacheProbeStdout = [byte[]](0..255)
+    [byte[]]$expectedCacheProbeStderr = [byte[]](255..0)
+    $cacheProbeArtifactExists = Test-Path -LiteralPath (
+        Join-Path $cacheProbeWorkingDirectory 'Microsoft')
+    $cacheProbeContractSatisfied = Test-ModuleCacheProbeContract `
+        -Result $cacheProbeResult `
+        -ExpectedStandardOutput $expectedCacheProbeStdout `
+        -ExpectedStandardError $expectedCacheProbeStderr `
+        -ArtifactExists $cacheProbeArtifactExists
+    if (-not $cacheProbeContractSatisfied) {
+        # hosted runner差を再現できない場合も、raw byteや引数を漏らさず
+        # timeout・長さ・artifactのどこで契約が崩れたかだけを残す。
+        Add-Failure (
+            'Expected module cache relaunch to preserve raw streams, exit code, and a clean working directory. ' +
+            ('Observed exit={0}; timedOut={1}; outputLimit={2}; stdoutBytes={3}; stderrBytes={4}; artifact={5}.' -f
+                $cacheProbeResult.ExitCode,
+                $cacheProbeResult.TimedOut,
+                [string]$cacheProbeResult.OutputLimitExceeded,
+                $cacheProbeResult.StandardOutputBytes.Length,
+                $cacheProbeResult.StandardErrorBytes.Length,
+                $cacheProbeArtifactExists))
+    }
+    $syntheticTimedOutProbe = [pscustomobject]@{
+        ExitCode = 23
+        TimedOut = $true
+        OutputLimitExceeded = ''
+        StandardOutputBytes = $expectedCacheProbeStdout
+        StandardErrorBytes = $expectedCacheProbeStderr
+    }
+    if (Test-ModuleCacheProbeContract `
+            -Result $syntheticTimedOutProbe `
+            -ExpectedStandardOutput $expectedCacheProbeStdout `
+            -ExpectedStandardError $expectedCacheProbeStderr `
+            -ArtifactExists $false) {
+        Add-Failure 'Expected module cache probe timeout to fail the contract.'
+    }
+
+    $cacheProbeRecords = @(
+        if ([IO.File]::Exists($cacheProbeReport)) {
+            [IO.File]::ReadAllLines($cacheProbeReport)
+        })
+    $cacheProbeParts = @(
+        foreach ($record in $cacheProbeRecords) {
+            ,($record -split ([char]9), 5)
+        })
+    $expectedSink = if ($script:isWindowsRuntime) { 'NUL' } else { '/dev/null' }
+    if ($cacheProbeParts.Count -ne 3 -or
+        $cacheProbeParts[0][0] -cne 'parent' -or
+        $cacheProbeParts[1][0] -cne 'child' -or
+        $cacheProbeParts[2][0] -cne 'after' -or
+        $cacheProbeParts[0][1] -eq $cacheProbeParts[1][1] -or
+        $cacheProbeParts[1][1] -ne $cacheProbeParts[2][1] -or
+        -not [string]::Equals(
+            $cacheProbeParts[0][2],
+            $cacheProbeParts[1][2],
+            $(if ($script:isWindowsRuntime) {
+                    [StringComparison]::OrdinalIgnoreCase
+                }
+                else {
+                    [StringComparison]::Ordinal
+                })) -or
+        -not [string]::Equals(
+            $cacheProbeParts[1][3],
+            $expectedSink,
+            $(if ($script:isWindowsRuntime) {
+                    [StringComparison]::OrdinalIgnoreCase
+                }
+                else {
+                    [StringComparison]::Ordinal
+                })) -or
+        $cacheProbeParts[0][4] -cne $expectedEncodedArguments -or
+        $cacheProbeParts[1][4] -cne $expectedEncodedArguments -or
+        $cacheProbeParts[2][4] -cne $expectedEncodedArguments) {
+        $cacheProbeRoles = @(
+            foreach ($part in $cacheProbeParts) {
+                if ($part.Count -gt 0) {
+                    [string]$part[0]
+                }
+                else {
+                    '<missing>'
+                }
+            }) -join ','
+        Add-Failure (
+            'Expected exactly one same-host relaunch with exact edge arguments and the platform null sink. ' +
+            ('Observed recordCount={0}; roles={1}.' -f
+                $cacheProbeParts.Count,
+                $cacheProbeRoles))
+    }
+
+    # helper欠落をnon-terminating errorのまま通さない。3 entrypointをhelperなしの
+    # directoryへ複製し、固定stderrだけで本体開始前に失敗することを検証する。
+    $bootstrapRoot = Join-Path $cacheProbeRoot 'missing-helper'
+    New-Item -ItemType Directory -Path $bootstrapRoot | Out-Null
+    [byte[]]$expectedBootstrapError = [Text.Encoding]::UTF8.GetBytes(
+        'PowerShell launcher aborted: module-cache-bootstrap-failed' +
+        [Environment]::NewLine)
+    foreach ($entrypointName in @(
+            'scan-private-markers.ps1',
+            'test-scan-private-markers.ps1',
+            'validate-oss-readiness.ps1')) {
+        $bootstrapCaseRoot = Join-Path $bootstrapRoot $entrypointName
+        New-Item -ItemType Directory -Path $bootstrapCaseRoot | Out-Null
+        $bootstrapScript = Join-Path $bootstrapCaseRoot $entrypointName
+        [IO.File]::Copy(
+            (Join-Path $root "scripts/$entrypointName"),
+            $bootstrapScript)
+        $bootstrapArguments = @('-NoProfile')
+        if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+            $bootstrapArguments += @('-ExecutionPolicy', 'Bypass')
+        }
+        $bootstrapArguments += @('-File', $bootstrapScript)
+        $bootstrapEnvironment = New-ChildEnvironment `
+            -BaseEnvironment (Get-ProcessEnvironmentClone) `
+            -RemoveNames $moduleCacheIsolationEnvironmentNames `
+            -Overrides @{
+                PSModuleAnalysisCachePath =
+                    'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+            }
+        $bootstrapResult = Invoke-BoundedProcess `
+            -FilePath $powerShellExecutable `
+            -ArgumentList $bootstrapArguments `
+            -Environment $bootstrapEnvironment `
+            -WorkingDirectory $bootstrapCaseRoot `
+            -TimeoutSeconds 10 `
+            -MaxStandardOutputBytes 128 `
+            -MaxStandardErrorBytes 128
+        if ($bootstrapResult.ExitCode -ne 1 -or
+            $bootstrapResult.TimedOut -or
+            $bootstrapResult.StandardOutputBytes.Length -ne 0 -or
+            -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                $bootstrapResult.StandardErrorBytes,
+                $expectedBootstrapError) -or
+            (Test-Path -LiteralPath (
+                    Join-Path $bootstrapCaseRoot 'Microsoft'))) {
+            Add-Failure "Expected missing helper to fail closed before entrypoint body: $entrypointName"
+        }
+    }
+
+    # 明示scan target自体や、それを指すjunction/symlinkをambient tempにしても、
+    # null device方式ならcache pathはfilesystemへ解決されない。
+    $explicitTarget = Join-Path $cacheProbeRoot 'explicit-target'
+    $explicitHome = Join-Path $cacheProbeRoot 'explicit-home'
+    New-Item -ItemType Directory -Path $explicitTarget, $explicitHome | Out-Null
+    [void](Invoke-FixtureGit `
+        -WorkingTree $explicitTarget `
+        -Arguments @('init', '--quiet') `
+        -IsolatedHome $explicitHome)
+    $explicitTempValues = @($explicitTarget)
+    $tempAlias = Join-Path $cacheProbeRoot 'explicit-target-temp-alias'
+    try {
+        if ($script:isWindowsRuntime) {
+            [void](New-Item `
+                -ItemType Junction `
+                -Path $tempAlias `
+                -Target $explicitTarget `
+                -ErrorAction Stop)
+        }
+        else {
+            [void](New-Item `
+                -ItemType SymbolicLink `
+                -Path $tempAlias `
+                -Target $explicitTarget `
+                -ErrorAction Stop)
+        }
+        $explicitTempValues += $tempAlias
+    }
+    catch {
+        Add-Failure 'Expected a junction or symlink fixture for module cache alias coverage.'
+    }
+
+    try {
+        foreach ($explicitTempValue in $explicitTempValues) {
+            $explicitResult = Invoke-Scanner `
+                -ScanPath $explicitTarget `
+                -EnvironmentOverrides @{
+                    PSModuleAnalysisCachePath =
+                        'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+                    WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED = '1'
+                    TEMP = $explicitTempValue
+                    TMP = $explicitTempValue
+                    TMPDIR = $explicitTempValue
+                } `
+                -RemoveEnvironmentNames $moduleCacheIsolationEnvironmentNames `
+                -TimeoutSeconds 40
+            $cacheArtifacts = @(
+                Get-ChildItem `
+                    -LiteralPath $explicitTarget `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Name -ceq 'Microsoft' -or
+                        $_.Name -ceq 'ModuleAnalysisCache' -or
+                        $_.Name -like
+                            'windows-git-stale-lock-recovery-module-cache-*'
+                    })
+            if ($explicitResult.ExitCode -ne 0 -or
+                $explicitResult.TimedOut -or
+                $cacheArtifacts.Count -ne 0) {
+                Add-Failure 'Expected explicit target TEMP and its physical alias to remain free of module cache artifacts.'
+            }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempAlias) {
+            # PS5.1 の Remove-Item は non-empty junction で確認待ちに入り得る。
+            # 所有fixtureのlink entryだけをplatform別の非再帰APIで外す。
+            if ($script:isWindowsRuntime) {
+                [IO.Directory]::Delete($tempAlias, $false)
+            }
+            else {
+                [IO.File]::Delete($tempAlias)
+            }
+        }
+    }
+
     Write-SelfTestProgress -Phase 'basic-and-output-bounds'
 
     # 存在しないhostile pathでも生pathやPowerShell error framingを返さず、

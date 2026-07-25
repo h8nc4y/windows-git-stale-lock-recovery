@@ -42,6 +42,37 @@ Public issues must not include:
   data.
 - Raw agent transcripts that contain any of the above.
 
+## PowerShell Module Cache Boundary
+
+Windows PowerShell 5.1 writes `ModuleAnalysisCache` asynchronously after
+module discovery. If its cache path is relative—such as when a restricted
+host cannot resolve the normal local application-data location—a successful
+long-running validation can otherwise leave a `Microsoft/Windows/PowerShell`
+tree in the invocation working directory.
+
+Every repository PowerShell entrypoint therefore bootstraps into a child of
+the same host before validation or scanning begins. The entrypoint's initial
+.NET-only phase points the current parent at `NUL` on Windows or `/dev/null`
+on non-Windows before cmdlet or module discovery. The child inherits that
+value before PowerShell starts, as
+required by the Microsoft cache contract, and runs only when the launcher
+marker and exact platform sink both matched before the entrypoint overwrote
+the current parent. An ambient marker paired with a relative path cannot skip
+the relaunch.
+
+The platform null device creates no cache namespace entry. Consequently the
+cache boundary performs no temporary-directory resolution and no cleanup;
+repository aliases, attacker-selected `TEMP` / `TMP`, reparse points, and
+validate-to-delete races cannot redirect cache creation or deletion. The
+launcher also inherits the parent's raw standard handles, preserves the exact
+child exit code, and strips its cache path and isolation marker before native
+Git is launched. A missing helper fails closed with a fixed diagnostic.
+
+Supported commands use `-NoProfile -File`, so the first entrypoint operation
+precedes module discovery. A profile or long-lived embedded host that already
+performed module discovery before invoking the script is outside this
+bootstrap guarantee; start a fresh documented CLI process in that case.
+
 ## Scanner Coverage
 
 The private-marker scanner (`scripts/scan-private-markers.ps1`) is a
