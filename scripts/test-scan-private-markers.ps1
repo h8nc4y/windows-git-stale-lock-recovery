@@ -558,6 +558,29 @@ function Invoke-BoundedProcess {
     }
 }
 
+function Test-ModuleCacheProbeContract {
+    param(
+        [object]$Result,
+        [byte[]]$ExpectedStandardOutput,
+        [byte[]]$ExpectedStandardError,
+        [bool]$ArtifactExists
+    )
+
+    # deadlineを広げてもtimeoutを成功扱いにしない。実process結果と高速な
+    # synthetic timeout fixtureの両方を同じ判定関数へ通す。
+    return (
+        $Result.ExitCode -eq 23 -and
+        -not $Result.TimedOut -and
+        [string]::IsNullOrEmpty($Result.OutputLimitExceeded) -and
+        [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+            $Result.StandardOutputBytes,
+            $ExpectedStandardOutput) -and
+        [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+            $Result.StandardErrorBytes,
+            $ExpectedStandardError) -and
+        -not $ArtifactExists)
+}
+
 function Assert-EnvironmentUnchanged {
     param(
         [hashtable]$Before,
@@ -1370,22 +1393,42 @@ exit 23
         -ArgumentList $cacheProbeArguments `
         -Environment $cacheProbeEnvironment `
         -WorkingDirectory $cacheProbeWorkingDirectory `
-        -TimeoutSeconds 30
+        -TimeoutSeconds 120
     [byte[]]$expectedCacheProbeStdout = [byte[]](0..255)
     [byte[]]$expectedCacheProbeStderr = [byte[]](255..0)
-    if ($cacheProbeResult.ExitCode -ne 23 -or
-        $cacheProbeResult.TimedOut -or
-        -not [string]::IsNullOrEmpty(
-            $cacheProbeResult.OutputLimitExceeded) -or
-        -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
-            $cacheProbeResult.StandardOutputBytes,
-            $expectedCacheProbeStdout) -or
-        -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
-            $cacheProbeResult.StandardErrorBytes,
-            $expectedCacheProbeStderr) -or
-        (Test-Path -LiteralPath (
-                Join-Path $cacheProbeWorkingDirectory 'Microsoft'))) {
-        Add-Failure 'Expected module cache relaunch to preserve raw streams, exit code, and a clean working directory.'
+    $cacheProbeArtifactExists = Test-Path -LiteralPath (
+        Join-Path $cacheProbeWorkingDirectory 'Microsoft')
+    $cacheProbeContractSatisfied = Test-ModuleCacheProbeContract `
+        -Result $cacheProbeResult `
+        -ExpectedStandardOutput $expectedCacheProbeStdout `
+        -ExpectedStandardError $expectedCacheProbeStderr `
+        -ArtifactExists $cacheProbeArtifactExists
+    if (-not $cacheProbeContractSatisfied) {
+        # hosted runner差を再現できない場合も、raw byteや引数を漏らさず
+        # timeout・長さ・artifactのどこで契約が崩れたかだけを残す。
+        Add-Failure (
+            'Expected module cache relaunch to preserve raw streams, exit code, and a clean working directory. ' +
+            ('Observed exit={0}; timedOut={1}; outputLimit={2}; stdoutBytes={3}; stderrBytes={4}; artifact={5}.' -f
+                $cacheProbeResult.ExitCode,
+                $cacheProbeResult.TimedOut,
+                [string]$cacheProbeResult.OutputLimitExceeded,
+                $cacheProbeResult.StandardOutputBytes.Length,
+                $cacheProbeResult.StandardErrorBytes.Length,
+                $cacheProbeArtifactExists))
+    }
+    $syntheticTimedOutProbe = [pscustomobject]@{
+        ExitCode = 23
+        TimedOut = $true
+        OutputLimitExceeded = ''
+        StandardOutputBytes = $expectedCacheProbeStdout
+        StandardErrorBytes = $expectedCacheProbeStderr
+    }
+    if (Test-ModuleCacheProbeContract `
+            -Result $syntheticTimedOutProbe `
+            -ExpectedStandardOutput $expectedCacheProbeStdout `
+            -ExpectedStandardError $expectedCacheProbeStderr `
+            -ArtifactExists $false) {
+        Add-Failure 'Expected module cache probe timeout to fail the contract.'
     }
 
     $cacheProbeRecords = @(
@@ -1424,7 +1467,20 @@ exit 23
         $cacheProbeParts[0][4] -cne $expectedEncodedArguments -or
         $cacheProbeParts[1][4] -cne $expectedEncodedArguments -or
         $cacheProbeParts[2][4] -cne $expectedEncodedArguments) {
-        Add-Failure 'Expected exactly one same-host relaunch with exact edge arguments and the platform null sink.'
+        $cacheProbeRoles = @(
+            foreach ($part in $cacheProbeParts) {
+                if ($part.Count -gt 0) {
+                    [string]$part[0]
+                }
+                else {
+                    '<missing>'
+                }
+            }) -join ','
+        Add-Failure (
+            'Expected exactly one same-host relaunch with exact edge arguments and the platform null sink. ' +
+            ('Observed recordCount={0}; roles={1}.' -f
+                $cacheProbeParts.Count,
+                $cacheProbeRoles))
     }
 
     # helper欠落をnon-terminating errorのまま通さない。3 entrypointをhelperなしの

@@ -20,7 +20,10 @@ The format loosely follows Keep a Changelog conventions.
   plus exact raw stdout/stderr bytes, nonzero exit propagation, edge
   arguments, same-host/one-relaunch behavior, missing-helper failure, explicit
   target `TEMP`, and junction/symlink aliases. The artifact is intentionally
-  not ignored, so recurrence stays visible.
+  not ignored, so recurrence stays visible. The hosted primary probe has a
+  bounded 120-second cold-start allowance, while synthetic timeout coverage
+  proves that reaching the deadline still fails closed; missing-helper and
+  explicit-target children retain their shorter individual deadlines.
 - Split the hosted Windows PowerShell 5.1 full self-test into its own bounded
   job and added opt-in anonymous phase markers, after the combined Windows job
   twice reached its deadline without identifying the stalled fixture.

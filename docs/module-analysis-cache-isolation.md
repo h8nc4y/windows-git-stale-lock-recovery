@@ -36,6 +36,10 @@ Windows PowerShell 5.1 の scanner / self-test が成功しても、相対
    fail closed にする。
 7. filesystem cache を作らないため、ambient `TEMP` / `TMP`、junction / symlink、
    cleanup の validate-to-delete 競合を cache 境界から除外する。
+8. hosted Windows PowerShell 5.1 の cold start を許容する primary probe は120秒、
+   missing-helper は各10秒、明示 target scanner は各40秒の個別上限を持つ。
+   `TimedOut = $true` の合成結果を同じ判定関数へ通し、上限拡張が再帰 hang を
+   成功扱いしないことを固定する。
 
 Microsoft の仕様どおり、確実な起動前設定は新しい child process で行う。通常の
 利用経路は README にある `-NoProfile -File` である。profile または長時間動作中の
@@ -53,6 +57,8 @@ Microsoft の仕様どおり、確実な起動前設定は新しい child proces
 - helper の無い directory へ3 entrypointを複製し、本体開始前の固定失敗を確認する。
 - 明示 scan target 自体を `TEMP` / `TMP` / `TMPDIR` にした場合と、その target を
   指す Windows junction / POSIX symlink の場合に cache artifact が無いことを確認する。
+- primary probe の実process結果と合成 `TimedOut = $true` を同じ契約関数へ渡し、
+  timeoutはraw streamやexitが一致していても必ず不合格にする。
 - `.gitignore` による除外は追加せず、呼出元 cwd の `Microsoft` tree 不在を確認する。
 
 ## 検証記録
@@ -62,18 +68,30 @@ Microsoft の仕様どおり、確実な起動前設定は新しい child proces
 - 修正後の Windows PowerShell 5.1 full self-test:
   marker-only + 相対 cache + 所有 cwd、149.3秒、exit 0、stderr 0、
   全11 phase PASS、cwd artifact 0。
+- hosted probe deadline修正後の Windows PowerShell 5.1 full self-test:
+  131.8秒、全 phase PASS、stderr 0、cwd artifact 0。監視再接続後の
+  OS exit code 直接値だけは未取得。
 - 修正後の PowerShell 7 full self-test:
   marker-only + 相対 cache + 所有 cwd、290.3秒、exit 0、stderr 0、
   全11 phase PASS、cwd artifact 0。
+- hosted probe deadline修正後の PowerShell 7 full self-test:
+  287.2秒、exit 0、stderr 0、全 phase PASS、cwd artifact 0。
 - PowerShell 7 / Windows PowerShell 5.1 readiness: ともに PASS。
 - Linux PowerShell 7.5.0:
   read-only bind mount、`--network none`、`/tmp` tmpfs、60.7秒、exit 0、
   stderr 0、readiness / full self-test / actual scan / staged diff check PASS。
+- hosted probe deadline修正後の Linux PowerShell 7.5:
+  source indexとtreeが一致する実体 `.git` fixtureをread-only bindし、
+  `--network none`、read-only rootfs、`/tmp` tmpfsで56.7秒、exit 0。
+  readiness / full self-test / actual scan / staged diff check PASS。
 - Gitleaks 8.30.1:
-  346,944 bytes、findings 0、exit 0。
+  timeout follow-up差分を含む履歴3 commitsでfindings 0、exit 0。
 - Semgrep 1.165.0 `p/default`:
   82 rules、23 files、findings 0、errors 0、exit 0。
-- CI: PR 作成前のため未確認。
+- PR run `30150242288`: PowerShell 7 / Ubuntu はPASS。Windows PowerShell
+  5.1 は全 phaseを完了した後、primary probeの30秒上限によりraw streamと
+  parent/child reportの2 assertionがFAIL。上限をbounded 120秒へ変更し、
+  redacted診断と合成timeout failure fixtureを追加した。修正後CIは未確認。
 
 ## 出典
 
