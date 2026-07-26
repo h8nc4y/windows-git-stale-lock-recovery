@@ -77,6 +77,25 @@ boundary must not create or clean a temporary filesystem object. Do not add
 `Microsoft/` to `.gitignore`, because that would hide a recurrence instead of
 fixing its source.
 
+Keep the entrypoint root boundary fail closed too. The fixture must distinguish
+an omitted `-Path` from an explicitly empty or whitespace-only value, compare
+the exact fixed UTF-8 diagnostics for hostile missing roots under both
+PowerShell hosts, and prove that readiness success through an owned
+hostile-name junction or symlink remains path-free. Use synthetic temporary
+fixtures only; never create, inspect, or delete a real stale lock for this
+contract. Keep the hosted PS5.1 cold-start allowances bounded: 45 seconds for
+an invalid-root child and 90 seconds for a full-readiness child, all inside a
+210-second cumulative phase with remaining-time deadlines and cleanup reserve.
+The 35-minute job envelope uses the observed attempt-1 job, the former
+105-second fixture bound, the new cumulative bound, and the unchanged product
+scanner maximum of 6-by-15-second Git children. The result must retain the
+measured 121-second job reserve, with at least 120 seconds reserved for the
+actual scanner step setup, bounded cleanup, and remaining job overhead.
+Within each child, use one absolute 20-second cleanup deadline across tree
+termination, process-exit waits, retries, and pipe disposal. Collapse start or
+cleanup exceptions to a fixed anonymous runner failure; never replay an
+executable path or platform exception text.
+
 The private-marker self-test always launches scanner children with the same
 PowerShell host that launched the self-test. Running the `powershell` and
 `pwsh` command sets above therefore provides two distinct compatibility
@@ -92,9 +111,10 @@ handling, index/worktree provenance, real merge-conflict stages, real
 present/deleted `git add -N`, sensitive dotenv/PEM/key candidates, binary
 safe-skip behavior, the 8,192 text-entry bound, incremental allowlist
 evaluation, explicit nested `.git` directory/leaf exclusion, fixed raw root
-diagnostics, and bounded explicit-LF UTF-8 finding output. GitHub Actions runs
-the full PowerShell 7 suite on Ubuntu in addition to both Windows hosts. The
-tests do not contact a service or use real credentials.
+diagnostics, explicit whitespace-root rejection, path-free readiness success,
+and bounded explicit-LF UTF-8 finding output. GitHub Actions runs the full
+PowerShell 7 suite on Ubuntu in addition to both Windows hosts. The tests do
+not contact a service or use real credentials.
 
 On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed, use
 forward slashes:

@@ -3,6 +3,10 @@ param(
     [string]$Path = ''
 )
 
+# 明示した空文字/空白pathをdefault rootへ置換しない。省略時だけrepo rootを
+# 選び、明示invalid scopeは固定root-resolution codeでfail closedにする。
+$pathWasSpecified = $PSBoundParameters.ContainsKey('Path')
+
 $moduleCacheBootstrapOriginalMarker =
     [Environment]::GetEnvironmentVariable(
         'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
@@ -63,7 +67,7 @@ catch {
     exit 1
 }
 $moduleCacheArguments = @()
-if (-not [string]::IsNullOrWhiteSpace($Path)) {
+if ($pathWasSpecified) {
     $moduleCacheArguments += @('-Path', $Path)
 }
 try {
@@ -85,11 +89,38 @@ if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 
-if ([string]::IsNullOrWhiteSpace($Path)) {
+if (-not $pathWasSpecified) {
     $Path = Split-Path -Parent $scriptRoot
 }
 
-$root = (Resolve-Path -LiteralPath $Path).Path
+# user-controlled pathや標準error framingを公開logへ再掲しない。
+try {
+    if ($pathWasSpecified -and [string]::IsNullOrWhiteSpace($Path)) {
+        throw 'readiness-root-invalid'
+    }
+    $root = (
+        Resolve-Path `
+            -LiteralPath $Path `
+            -ErrorAction Stop
+    ).Path
+}
+catch {
+    [byte[]]$rootFailureBytes = [Text.Encoding]::UTF8.GetBytes(
+        'OSS readiness validation aborted: readiness-root-resolution-failed' +
+        [char]10)
+    $rootFailureOutput = [Console]::OpenStandardError()
+    try {
+        $rootFailureOutput.Write(
+            $rootFailureBytes,
+            0,
+            $rootFailureBytes.Length)
+        $rootFailureOutput.Flush()
+    }
+    finally {
+        $rootFailureOutput.Dispose()
+    }
+    exit 1
+}
 $failures = New-Object System.Collections.Generic.List[string]
 
 function Add-Failure {
@@ -461,6 +492,7 @@ $requiredFiles = @(
     'SECURITY.md',
     'SKILL.md',
     'docs/SKILL.ja.md',
+    'docs/hostile-root-diagnostic-hardening.md',
     'docs/module-analysis-cache-isolation.md',
     'examples/five-point-check-checklist.md',
     'examples/single-lock-recovery-walkthrough.md',
@@ -491,17 +523,19 @@ Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Security' -De
 Assert-FileContains -RelativePath 'README.md' -Pattern 'CONTRIBUTING\.md' -Description 'link to CONTRIBUTING.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'SECURITY\.md' -Description 'link to SECURITY.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Description 'link to the Japanese skill version'
+Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/hostile-root-diagnostic-hardening\.md' -Description 'hostile root diagnostic hardening record'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/module-analysis-cache-isolation\.md' -Description 'module cache isolation maintenance record'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)index blob.*worktree|worktree.*index blob' -Description 'index/worktree scanner provenance contract'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)cat-file --batch.*at most six Git children' -Description 'bounded batch Git child contract'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)ls-files -z --stage.*ls-files -z --stage --debug.*match exactly' -Description 'stable raw index and flags snapshot contract'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)8,192 text-entry.*16 MiB index-debug' -Description 'bounded index-layer contract'
-Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)scan-root-resolution-failed.*never echoes.*PowerShell error framing' -Description 'fixed root-resolution diagnostic contract'
+Assert-FileContains -RelativePath 'README.md' -Pattern '(?is)omitted `-Path`.*whitespace-only.*scan-root-resolution-failed.*self-test-root-resolution-failed.*readiness-root-resolution-failed.*PowerShell error framing.*path-free fixed line' -Description 'shared fixed root-resolution diagnostic contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)\.env.*\.pem.*\.key' -Description 'sensitive text candidate contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)CE_INTENT_TO_ADD.*empty-blob' -Description 'real intent-to-add flag contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)trusted runtime API.*ambient `OS`' -Description 'trusted platform selection contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)Unicode control/Format.*per line.*per file.*globally.*64 KiB' -Description 'bounded escaped diagnostic contract'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)failure\s+prefix.*TSV header.*explicit LF.*64 KiB.*actual bytes' -Description 'complete UTF-8 finding payload contract'
+Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?is)Entrypoint Root Diagnostic Boundary.*whitespace-only.*readiness-root-resolution-failed.*path-free fixed.*real Git lock' -Description 'root diagnostic security boundary'
 Assert-FileContains -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern "(?is)return 'NUL'.*return '/dev/null'.*PSModuleAnalysisCachePath" -Description 'official platform null-device module cache sink'
 Assert-FileContains -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern '(?is)ProcessStartInfo.*CreateNoWindow\s*=\s*\$false.*RedirectStandardOutput\s*=\s*\$false.*RedirectStandardError\s*=\s*\$false.*WaitForExit\(\).*ExitCode' -Description 'same-host raw stream and exit-code preserving launcher'
 Assert-FileOmits -RelativePath 'scripts/module-analysis-cache-isolation.ps1' -Pattern '(?i)Remove-Item|File\]::Delete|Directory\]::Delete|CreateDirectory|GetTempPath' -Description 'temporary filesystem creation or cleanup API'
@@ -514,13 +548,83 @@ foreach ($entryScript in @(
         -RelativePath $entryScript `
         -Pattern '(?is)OriginalMarker.*OriginalPath.*AlreadyIsolated.*SetEnvironmentVariable.*module-analysis-cache-isolation\.ps1.*module-cache-bootstrap-failed.*Initialize-ModuleAnalysisCacheIsolation.*BootstrapAlreadyIsolated' `
         -Description 'pre-overwrite marker/sink capture and fail-closed null-device bootstrap'
+
+    # 各entrypointが「省略」と「明示invalid」を同じrootへ畳み込まない契約を
+    # source-levelにも固定し、bootstrap childへの空白引数欠落を防ぐ。
+    Assert-FileContains `
+        -RelativePath $entryScript `
+        -Pattern '(?is)\$pathWasSpecified\s*=\s*\$PSBoundParameters\.ContainsKey\(''Path''\).*\$moduleCacheArguments.*if\s*\(\$pathWasSpecified\).*?@\(.*?''-Path''\s*,\s*\$Path.*?if\s*\(-not\s+\$pathWasSpecified\)\s*\{\s*\$Path\s*=.*?if\s*\(\$pathWasSpecified\s+-and\s+\[string\]::IsNullOrWhiteSpace\(\$Path\)\)' `
+        -Description 'omitted versus explicit invalid root forwarding and selection contract'
+}
+$entryRootDiagnosticContracts = @(
+    @{
+        RelativePath = 'scripts/scan-private-markers.ps1'
+        FailureCode = ('scan-root-resolution-' + 'failed')
+        FailureStream = ('OpenStandard' + 'Output')
+    },
+    @{
+        RelativePath = 'scripts/test-scan-private-markers.ps1'
+        FailureCode = ('self-test-root-resolution-' + 'failed')
+        FailureStream = ('OpenStandard' + 'Error')
+    },
+    @{
+        RelativePath = 'scripts/validate-oss-readiness.ps1'
+        # validator自身のassertion文字列だけで検査が成立しないよう分割する。
+        # runtimeで再構成したpatternはentrypoint実装の連続した固定値だけを探す。
+        FailureCode = ('readiness-root-resolution-' + 'failed')
+        FailureStream = ('OpenStandard' + 'Error')
+    })
+foreach ($entryRootDiagnosticContract in $entryRootDiagnosticContracts) {
+    # 固定codeをraw byte streamへ直接書く順序まで確認し、Write-Error由来の
+    # path/error framingが再導入される変更をreadinessで拒否する。
+    $rootDiagnosticPattern = (
+        '(?is)' +
+        [Regex]::Escape($entryRootDiagnosticContract.FailureCode) +
+        '.*?' +
+        [Regex]::Escape($entryRootDiagnosticContract.FailureStream))
+    Assert-FileContains `
+        -RelativePath $entryRootDiagnosticContract.RelativePath `
+        -Pattern $rootDiagnosticPattern `
+        -Description 'fixed raw UTF-8 root diagnostic stream contract'
 }
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)module-cache-isolation.*OriginalMarker.*AlreadyIsolated.*0\.\.255.*255\.\.0.*Test-ModuleCacheProbeContract.*missing-helper.*explicit-target.*Junction.*SymbolicLink' -Description 'module cache marker-only, raw stream, bootstrap, explicit-target, and physical-alias regression fixtures'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Test-ModuleCacheProbeContract\s*\{.*?return\s*\(.*?-not\s+\$Result\.TimedOut.*?\)\s*\}' -Description 'module cache probe contract rejects timeout'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$cacheProbeResult\s*=\s*Invoke-BoundedProcess.*?-TimeoutSeconds\s+120.*?\$cacheProbeContractSatisfied\s*=\s*Test-ModuleCacheProbeContract.*?-Result\s+\$cacheProbeResult.*?if\s*\(-not\s+\$cacheProbeContractSatisfied\)\s*\{.*?Add-Failure' -Description 'hosted module cache probe deadline and actual-result contract wiring'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$syntheticTimedOutProbe.*?TimedOut\s*=\s*\$true.*?if\s*\(Test-ModuleCacheProbeContract.*?-Result\s+\$syntheticTimedOutProbe.*?\)\s*\{.*?Expected module cache probe timeout to fail the contract' -Description 'synthetic module cache timeout failure contract'
 Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)foreach\s*\(\$entrypointName.*?\$bootstrapResult\s*=\s*Invoke-BoundedProcess.*?-TimeoutSeconds\s+10.*?foreach\s*\(\$explicitTempValue.*?\$explicitResult\s*=\s*Invoke-Scanner.*?-TimeoutSeconds\s+40' -Description 'module cache child fixture individual deadlines'
-Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)portable real-Git.*merge-conflict.*full PowerShell 7 suite.*Ubuntu' -Description 'POSIX real-Git self-test contract'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$hostileMissingRoot.*?\$rootFailureCases.*?self-test-root-resolution-failed.*?readiness-root-resolution-failed.*?\$invalidRootCases.*?hostile-missing.*?explicit-whitespace.*?explicit-empty.*?foreach\s*\(\$invalidRootCase\s+in\s+\$invalidRootCases\).*?Expected fixed root-resolution failure without raw path framing' -Description 'hostile missing, explicit whitespace, and explicit empty root failure fixtures'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)scan-root-resolution-failed.*?\$whitespaceScannerResult.*?Expected explicit whitespace scanner root to fail closed' -Description 'scanner explicit whitespace root fixture'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$hostileReadinessAlias.*?Junction.*?SymbolicLink.*?OSS readiness validation passed\..*?Expected readiness success output to omit the resolved root' -Description 'path-free readiness success through hostile physical alias fixture'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$rootFailureTimeoutSeconds\s*=\s*45.*?\$readinessSuccessTimeoutSeconds\s*=\s*90.*?case=.*?timeout=.*?stdout-bytes=.*?stderr-bytes=' -Description 'bounded hosted PS5.1 child allowances and anonymous diagnostics'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Get-RemainingPhaseTimeoutSeconds.*?\$RequestedTimeoutSeconds.*?\$PhaseBudgetSeconds.*?\$CleanupReserveSeconds.*?\$ElapsedMilliseconds.*?return\s+0.*?\[Math\]::Min' -Description 'cumulative phase remaining-time helper'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$rootDiagnosticPhaseBudgetSeconds\s*=\s*210.*?\$rootDiagnosticCleanupReserveSeconds\s*=\s*20.*?\$rootDiagnosticPhaseStopwatch\s*=\s*\(?\s*\[System\.Diagnostics\.Stopwatch\]::StartNew\(\).*?\$rootFailureChildTimeoutSeconds\s*=\s*Get-RemainingPhaseTimeoutSeconds.*?-RequestedTimeoutSeconds\s+\$rootFailureTimeoutSeconds.*?\$rootFailureResult\s*=\s*Invoke-BoundedProcess.*?-TimeoutSeconds\s+\$rootFailureChildTimeoutSeconds.*?\$whitespaceScannerChildTimeoutSeconds\s*=\s*Get-RemainingPhaseTimeoutSeconds.*?-RequestedTimeoutSeconds\s+15.*?\$whitespaceScannerResult\s*=\s*Invoke-Scanner.*?-TimeoutSeconds\s+\$whitespaceScannerChildTimeoutSeconds.*?\$readinessChildTimeoutSeconds\s*=\s*Get-RemainingPhaseTimeoutSeconds.*?-RequestedTimeoutSeconds\s+\$readinessSuccessTimeoutSeconds.*?\$readinessResult\s*=\s*Invoke-BoundedProcess.*?-TimeoutSeconds\s+\$readinessChildTimeoutSeconds.*?\$rootDiagnosticPhaseStopwatch\.Stop\(\).*?Elapsed\.TotalSeconds\s+-gt\s*\$rootDiagnosticPhaseBudgetSeconds' -Description '210-second cumulative root diagnostic phase budget and remaining child deadlines'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)root-diagnostic-phase-budget-exhausted.*?root-diagnostic-phase-budget-overrun' -Description 'fixed cumulative phase early and overrun failures'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$hostedWindowsPowerShellObservedFailedJobSeconds\s*=\s*1784.*?\$rootDiagnosticOriginalFixtureBudgetSeconds\s*=\s*105.*?\$hostedWindowsPowerShellScannerBudgetSeconds\s*=\s*90.*?\$hostedWindowsPowerShellJobBudgetSeconds\s*=\s*2100.*?\$hostedWindowsPowerShellEnvelopeSeconds.*?\$hostedWindowsPowerShellMinimumOverheadReserveSeconds\s*=\s*120.*?\$hostedWindowsPowerShellEnvelopeSeconds\s+-ne\s+1979.*?\$hostedWindowsPowerShellJobReserveSeconds\s+-lt\s+\$hostedWindowsPowerShellMinimumOverheadReserveSeconds.*?Add-Failure' -Description 'Windows PowerShell 5.1 job envelope and overhead proof'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Get-RemainingCleanupWaitMilliseconds.*?\$DeadlineMilliseconds.*?\$ElapsedMilliseconds.*?\$MaximumWaitMilliseconds.*?return\s+0.*?\[Math\]::Min' -Description 'shared absolute cleanup deadline calculation'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Stop-ProcessTreeBounded.*?\$CleanupStopwatch.*?\$CleanupDeadlineMilliseconds.*?Get-RemainingCleanupWaitMilliseconds.*?WaitForExit\(\s*\$taskkillWaitMilliseconds\s*\).*?Get-RemainingCleanupWaitMilliseconds.*?WaitForExit\(\s*\$taskkillTerminationWaitMilliseconds\s*\)' -Description 'taskkill waits consume one cleanup deadline'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Complete-BoundedProcessStreams.*?\$CleanupStopwatch.*?\$CleanupDeadlineMilliseconds.*?Get-RemainingCleanupWaitMilliseconds.*?WaitAll.*?Get-RemainingCleanupWaitMilliseconds.*?WaitAll' -Description 'pipe waits consume one cleanup deadline'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)function\s+Invoke-BoundedProcess.*?\[int\]\$CleanupDeadlineMilliseconds\s*=\s*20000.*?\$cleanupStopwatch\s*=\s*\$null.*?\$cleanupStopwatch\s*=\s*\[System\.Diagnostics\.Stopwatch\]::StartNew\(\).*?Stop-ProcessTreeBounded.*?-CleanupStopwatch\s+\$cleanupStopwatch.*?Get-RemainingCleanupWaitMilliseconds.*?Complete-BoundedProcessStreams.*?-CleanupStopwatch\s+\$cleanupStopwatch.*?catch\s*\{.*?throw\s+''bounded-process-runner-failed''' -Description 'single cleanup deadline and fixed anonymous runner failure'
+Assert-FileOmits -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?im)^\s*throw[^\r\n]*\$FilePath' -Description 'runner exceptions reflecting executable paths'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$cleanupWaitHelper\s*=\s*Get-Command.*?Get-RemainingCleanupWaitMilliseconds.*?Expected a shared absolute cleanup deadline helper.*?\$cleanupWaitCases.*?Deadline\s*=\s*20000.*?Elapsed\s*=\s*20000.*?Expected\s*=\s*0' -Description 'runtime cleanup deadline boundary fixtures'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)\$hostileRunnerPath.*?Invoke-BoundedProcess.*?bounded-process-runner-failed.*?Contains\(\$hostileRunnerPath\).*?Expected a fixed anonymous runner failure without exception text' -Description 'cross-host anonymous runner exception fixture'
+Assert-FileContains -RelativePath 'scripts/test-scan-private-markers.ps1' -Pattern '(?is)CleanupDeadlineMilliseconds''\).*?Invoke-BoundedProcess.*?-TimeoutSeconds\s+2.*?-CleanupDeadlineMilliseconds\s+2000.*?Elapsed\.TotalSeconds\s+-gt\s+5.*?Expected timeout and all cleanup to honor the shared deadline' -Description 'real-time shared cleanup deadline fixture'
+Assert-FileContains -RelativePath 'scripts/scan-private-markers.ps1' -Pattern '(?is)\[int\]\$GitCommandTimeoutSeconds\s*=\s*15' -Description 'unchanged 15-second product Git child deadline'
+$scannerContractSource = Get-Content `
+    -LiteralPath (Get-RepoFilePath `
+        -RelativePath 'scripts/scan-private-markers.ps1') `
+    -Raw
+Assert-TextMatchCount `
+    -Text $scannerContractSource `
+    -Pattern '(?m)^\s*-TimeoutSeconds\s+\$GitCommandTimeoutSeconds\s*`?\s*$' `
+    -ExpectedCount 6 `
+    -Description 'product scanner bounded Git child call sites'
+Assert-FileContains -RelativePath 'scripts/validate-oss-readiness.ps1' -Pattern '(?is)OSS readiness validation passed\..*OpenStandardOutput' -Description 'path-free fixed readiness success output'
+Assert-FileOmits -RelativePath 'scripts/validate-oss-readiness.ps1' -Pattern ('OSS readiness validation passed' + '\s+for') -Description 'resolved root in readiness success output'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)portable real-Git fixtures.*real merge-conflict.*GitHub Actions.*PowerShell 7 suite.*Ubuntu' -Description 'POSIX real-Git self-test contract'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)omitted `-Path`.*whitespace-only.*hostile missing roots.*hostile-name junction or symlink.*real stale lock' -Description 'synthetic root boundary fixture contract'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)210-second cumulative.*35-minute.*6-by-15-second.*121-second' -Description 'hosted Windows PowerShell job envelope contract'
+Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?is)absolute 20-second cleanup deadline.*fixed anonymous runner failure' -Description 'shared cleanup deadline and anonymous runner exception contract'
+Assert-FileContains -RelativePath 'docs/hostile-root-diagnostic-hardening.md' -Pattern '(?im)^CI envelope evidence:\s*job=29m44s;\s*self-test step=28m40s;\s*readiness step=51s;\s*scanner step=skipped;\s*direct cause=unconfirmed\.\s*$' -Description 'accurate hosted runner timing evidence'
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
@@ -538,5 +642,18 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Host "OSS readiness validation passed for $root"
+[byte[]]$readinessSuccessBytes = [Text.Encoding]::UTF8.GetBytes(
+    'OSS readiness validation passed.' +
+    [char]10)
+$readinessSuccessOutput = [Console]::OpenStandardOutput()
+try {
+    $readinessSuccessOutput.Write(
+        $readinessSuccessBytes,
+        0,
+        $readinessSuccessBytes.Length)
+    $readinessSuccessOutput.Flush()
+}
+finally {
+    $readinessSuccessOutput.Dispose()
+}
 exit 0

@@ -3,6 +3,10 @@ param(
     [string]$Path = ''
 )
 
+# 明示した空文字/空白pathをdefault rootへ置換しない。合成invalid scopeも
+# childへそのまま転送し、固定root-resolution codeでfail closedにする。
+$pathWasSpecified = $PSBoundParameters.ContainsKey('Path')
+
 $moduleCacheBootstrapOriginalMarker =
     [Environment]::GetEnvironmentVariable(
         'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
@@ -63,7 +67,7 @@ catch {
     exit 1
 }
 $moduleCacheArguments = @()
-if (-not [string]::IsNullOrWhiteSpace($Path)) {
+if ($pathWasSpecified) {
     $moduleCacheArguments += @('-Path', $Path)
 }
 try {
@@ -87,11 +91,38 @@ if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 
-if ([string]::IsNullOrWhiteSpace($Path)) {
+if (-not $pathWasSpecified) {
     $Path = Split-Path -Parent $scriptRoot
 }
 
-$root = (Resolve-Path -LiteralPath $Path).Path
+# raw pathをPowerShell標準error framingへ流さず、固定UTF-8 codeだけを返す。
+try {
+    if ($pathWasSpecified -and [string]::IsNullOrWhiteSpace($Path)) {
+        throw 'self-test-root-invalid'
+    }
+    $root = (
+        Resolve-Path `
+            -LiteralPath $Path `
+            -ErrorAction Stop
+    ).Path
+}
+catch {
+    [byte[]]$rootFailureBytes = [Text.Encoding]::UTF8.GetBytes(
+        'Private marker self-test aborted: self-test-root-resolution-failed' +
+        [char]10)
+    $rootFailureOutput = [Console]::OpenStandardError()
+    try {
+        $rootFailureOutput.Write(
+            $rootFailureBytes,
+            0,
+            $rootFailureBytes.Length)
+        $rootFailureOutput.Flush()
+    }
+    finally {
+        $rootFailureOutput.Dispose()
+    }
+    exit 1
+}
 $scanner = Join-Path $root 'scripts/scan-private-markers.ps1'
 if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
     throw "Missing scanner script: $scanner"
@@ -106,6 +137,96 @@ $failures = New-Object System.Collections.Generic.List[string]
 function Add-Failure {
     param([string]$Message)
     $failures.Add($Message) | Out-Null
+}
+
+# 複数childが共有するphase deadlineから、次のchildへ渡せる秒数だけを返す。
+# timeout後のtree/pipe cleanup用reserveを先に差し引き、phase全体の上限を守る。
+function Get-RemainingPhaseTimeoutSeconds {
+    param(
+        [int]$RequestedTimeoutSeconds,
+        [int]$PhaseBudgetSeconds,
+        [int]$CleanupReserveSeconds,
+        [long]$ElapsedMilliseconds
+    )
+
+    if ($RequestedTimeoutSeconds -le 0 -or
+        $PhaseBudgetSeconds -le 0 -or
+        $CleanupReserveSeconds -lt 0 -or
+        $CleanupReserveSeconds -ge $PhaseBudgetSeconds) {
+        return 0
+    }
+
+    $usableDeadlineMilliseconds = (
+        [long]($PhaseBudgetSeconds - $CleanupReserveSeconds) * 1000)
+    $remainingMilliseconds = (
+        $usableDeadlineMilliseconds -
+        [Math]::Max([long]0, $ElapsedMilliseconds))
+    if ($remainingMilliseconds -lt 1000) {
+        return 0
+    }
+
+    $remainingSeconds = [int][Math]::Floor(
+        [double]$remainingMilliseconds / 1000)
+    return [Math]::Min($RequestedTimeoutSeconds, $remainingSeconds)
+}
+
+# boundary値をpure calculationで先に固定し、phase実装が個別timeoutの単純加算へ
+# 戻る変更をfull fixtureより早く検出する。
+$remainingPhaseTimeoutCases = @(
+    [pscustomobject]@{
+        Requested = 45
+        ElapsedMilliseconds = 0
+        Expected = 45
+    },
+    [pscustomobject]@{
+        Requested = 90
+        ElapsedMilliseconds = 100000
+        Expected = 90
+    },
+    [pscustomobject]@{
+        Requested = 90
+        ElapsedMilliseconds = 170000
+        Expected = 20
+    },
+    [pscustomobject]@{
+        Requested = 45
+        ElapsedMilliseconds = 189001
+        Expected = 0
+    })
+foreach ($remainingPhaseTimeoutCase in $remainingPhaseTimeoutCases) {
+    $actualRemainingPhaseTimeout = Get-RemainingPhaseTimeoutSeconds `
+        -RequestedTimeoutSeconds $remainingPhaseTimeoutCase.Requested `
+        -PhaseBudgetSeconds 210 `
+        -CleanupReserveSeconds 20 `
+        -ElapsedMilliseconds $remainingPhaseTimeoutCase.ElapsedMilliseconds
+    if ($actualRemainingPhaseTimeout -ne $remainingPhaseTimeoutCase.Expected) {
+        Add-Failure 'Remaining phase timeout calculation violated its boundary contract.'
+    }
+}
+
+# attempt 1のjob実測へ、旧fixture上限から新累積上限への増分と、製品scannerの
+# 6 child × 15秒を加えても35分未満になることをruntimeで証明する。
+$hostedWindowsPowerShellObservedFailedJobSeconds = 1784
+$rootDiagnosticOriginalFixtureBudgetSeconds = 105
+$rootDiagnosticPhaseBudgetSeconds = 210
+$rootDiagnosticCleanupReserveSeconds = 20
+$hostedWindowsPowerShellScannerBudgetSeconds = 90
+$hostedWindowsPowerShellJobBudgetSeconds = 2100
+$hostedWindowsPowerShellEnvelopeSeconds = (
+    $hostedWindowsPowerShellObservedFailedJobSeconds +
+    ($rootDiagnosticPhaseBudgetSeconds -
+        $rootDiagnosticOriginalFixtureBudgetSeconds) +
+    $hostedWindowsPowerShellScannerBudgetSeconds)
+$hostedWindowsPowerShellJobReserveSeconds = (
+    $hostedWindowsPowerShellJobBudgetSeconds -
+    $hostedWindowsPowerShellEnvelopeSeconds)
+$hostedWindowsPowerShellMinimumOverheadReserveSeconds = 120
+if ($hostedWindowsPowerShellEnvelopeSeconds -ne 1979 -or
+    $hostedWindowsPowerShellEnvelopeSeconds -ge
+        $hostedWindowsPowerShellJobBudgetSeconds -or
+    $hostedWindowsPowerShellJobReserveSeconds -lt
+        $hostedWindowsPowerShellMinimumOverheadReserveSeconds) {
+    Add-Failure 'Windows PowerShell hosted job envelope exceeded its fixed budget.'
 }
 
 $script:selfTestProgressEnabled = (
@@ -266,8 +387,84 @@ function New-ChildEnvironment {
     return $child
 }
 
+function Get-RemainingCleanupWaitMilliseconds {
+    param(
+        [int]$DeadlineMilliseconds,
+        [long]$ElapsedMilliseconds,
+        [int]$MaximumWaitMilliseconds
+    )
+
+    # cleanup中の全waitは同じ絶対deadlineから残時間を取り出す。個別上限を
+    # 順番に満額消費させず、deadline到達後は新しいwaitを開始しない。
+    if ($DeadlineMilliseconds -le 0 -or
+        $MaximumWaitMilliseconds -le 0) {
+        return 0
+    }
+    $remainingMilliseconds = (
+        [long]$DeadlineMilliseconds -
+        [Math]::Max([long]0, $ElapsedMilliseconds))
+    if ($remainingMilliseconds -le 0) {
+        return 0
+    }
+    return [int][Math]::Min(
+        [long]$MaximumWaitMilliseconds,
+        $remainingMilliseconds)
+}
+
+# cleanup全体は各waitの上限を足し合わせず、単一の絶対deadlineから残時間を
+# 切り出す。boundaryをruntimeでも固定し、個別waitの再加算を検出する。
+$cleanupWaitHelper = Get-Command `
+    -Name 'Get-RemainingCleanupWaitMilliseconds' `
+    -CommandType Function `
+    -ErrorAction SilentlyContinue
+if ($null -eq $cleanupWaitHelper) {
+    Add-Failure 'Expected a shared absolute cleanup deadline helper.'
+}
+else {
+    $cleanupWaitCases = @(
+        [pscustomobject]@{
+            Deadline = 20000
+            Elapsed = 0
+            Maximum = 5000
+            Expected = 5000
+        },
+        [pscustomobject]@{
+            Deadline = 20000
+            Elapsed = 17000
+            Maximum = 5000
+            Expected = 3000
+        },
+        [pscustomobject]@{
+            Deadline = 20000
+            Elapsed = 19999
+            Maximum = 5000
+            Expected = 1
+        },
+        [pscustomobject]@{
+            Deadline = 20000
+            Elapsed = 20000
+            Maximum = 5000
+            Expected = 0
+        })
+    foreach ($cleanupWaitCase in $cleanupWaitCases) {
+        $actualCleanupWait =
+            Get-RemainingCleanupWaitMilliseconds `
+                -DeadlineMilliseconds $cleanupWaitCase.Deadline `
+                -ElapsedMilliseconds $cleanupWaitCase.Elapsed `
+                -MaximumWaitMilliseconds $cleanupWaitCase.Maximum
+        if ($actualCleanupWait -ne $cleanupWaitCase.Expected) {
+            Add-Failure (
+                'Shared cleanup deadline calculation violated its boundary contract.')
+        }
+    }
+}
+
 function Stop-ProcessTreeBounded {
-    param([System.Diagnostics.Process]$Process)
+    param(
+        [System.Diagnostics.Process]$Process,
+        [System.Diagnostics.Stopwatch]$CleanupStopwatch,
+        [int]$CleanupDeadlineMilliseconds
+    )
 
     if ($Process.HasExited) {
         return
@@ -299,11 +496,33 @@ function Stop-ProcessTreeBounded {
         $taskkill = New-Object System.Diagnostics.Process
         $taskkill.StartInfo = $taskkillInfo
         try {
+            $taskkillStartBudgetMilliseconds =
+                Get-RemainingCleanupWaitMilliseconds `
+                    -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                    -ElapsedMilliseconds $CleanupStopwatch.ElapsedMilliseconds `
+                    -MaximumWaitMilliseconds 5000
+            if ($taskkillStartBudgetMilliseconds -le 0) {
+                throw 'bounded-process-cleanup-deadline-exceeded'
+            }
             [void]$taskkill.Start()
-            if (-not $taskkill.WaitForExit(5000)) {
+            $taskkillWaitMilliseconds =
+                Get-RemainingCleanupWaitMilliseconds `
+                    -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                    -ElapsedMilliseconds $CleanupStopwatch.ElapsedMilliseconds `
+                    -MaximumWaitMilliseconds 5000
+            if ($taskkillWaitMilliseconds -le 0 -or
+                -not $taskkill.WaitForExit($taskkillWaitMilliseconds)) {
                 $taskkill.Kill()
-                if (-not $taskkill.WaitForExit(2000)) {
-                    throw 'taskkill did not exit after bounded termination.'
+                $taskkillTerminationWaitMilliseconds =
+                    Get-RemainingCleanupWaitMilliseconds `
+                        -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                        -ElapsedMilliseconds `
+                            $CleanupStopwatch.ElapsedMilliseconds `
+                        -MaximumWaitMilliseconds 2000
+                if ($taskkillTerminationWaitMilliseconds -le 0 -or
+                    -not $taskkill.WaitForExit(
+                        $taskkillTerminationWaitMilliseconds)) {
+                    throw 'bounded-process-cleanup-deadline-exceeded'
                 }
             }
         }
@@ -332,22 +551,32 @@ function Complete-BoundedProcessStreams {
     param(
         [System.Diagnostics.Process]$Process,
         [System.Threading.Tasks.Task[]]$Tasks,
-        [int]$WaitMilliseconds = 1000
+        [System.Diagnostics.Stopwatch]$CleanupStopwatch,
+        [int]$CleanupDeadlineMilliseconds,
+        [int]$MaximumWaitMilliseconds = 1000
     )
 
     # self-test runner 自身も未完了 ReadAsync を残さない。まず EOF を待ち、
-    # 必要な場合だけ parent endpoint を閉じて、完了状態を再確認する。
+    # 必要な場合だけ parent endpoint を閉じる。両waitは同じcleanup deadlineの
+    # 残時間しか使わず、retryで予約時間を再開しない。
     $pending = @($Tasks | Where-Object {
         $null -ne $_ -and -not $_.IsCompleted
     })
     if ($pending.Count -gt 0) {
-        try {
-            [void][System.Threading.Tasks.Task]::WaitAll(
-                [System.Threading.Tasks.Task[]]$pending,
-                $WaitMilliseconds)
-        }
-        catch {
-            # fault/cancel も完了なので、下の IsCompleted で判定する。
+        $firstPipeWaitMilliseconds =
+            Get-RemainingCleanupWaitMilliseconds `
+                -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                -ElapsedMilliseconds $CleanupStopwatch.ElapsedMilliseconds `
+                -MaximumWaitMilliseconds $MaximumWaitMilliseconds
+        if ($firstPipeWaitMilliseconds -gt 0) {
+            try {
+                [void][System.Threading.Tasks.Task]::WaitAll(
+                    [System.Threading.Tasks.Task[]]$pending,
+                    $firstPipeWaitMilliseconds)
+            }
+            catch {
+                # fault/cancel も完了なので、下の IsCompleted で判定する。
+            }
         }
     }
 
@@ -357,20 +586,27 @@ function Complete-BoundedProcessStreams {
     if ($pending.Count -gt 0) {
         $Process.StandardOutput.Dispose()
         $Process.StandardError.Dispose()
-        try {
-            [void][System.Threading.Tasks.Task]::WaitAll(
-                [System.Threading.Tasks.Task[]]$pending,
-                $WaitMilliseconds)
-        }
-        catch {
-            # endpoint close に伴う fault/cancel は許容し、未完了だけ拒否する。
+        $secondPipeWaitMilliseconds =
+            Get-RemainingCleanupWaitMilliseconds `
+                -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                -ElapsedMilliseconds $CleanupStopwatch.ElapsedMilliseconds `
+                -MaximumWaitMilliseconds $MaximumWaitMilliseconds
+        if ($secondPipeWaitMilliseconds -gt 0) {
+            try {
+                [void][System.Threading.Tasks.Task]::WaitAll(
+                    [System.Threading.Tasks.Task[]]$pending,
+                    $secondPipeWaitMilliseconds)
+            }
+            catch {
+                # endpoint close に伴う fault/cancel は許容し、未完了だけ拒否する。
+            }
         }
     }
 
     if (@($Tasks | Where-Object {
             $null -ne $_ -and -not $_.IsCompleted
         }).Count -gt 0) {
-        throw 'Child process pipe cleanup did not complete after bounded disposal.'
+        throw 'bounded-process-cleanup-deadline-exceeded'
     }
 }
 
@@ -381,6 +617,7 @@ function Invoke-BoundedProcess {
         [hashtable]$Environment,
         [string]$WorkingDirectory = '',
         [int]$TimeoutSeconds = 20,
+        [int]$CleanupDeadlineMilliseconds = 20000,
         [int]$MaxStandardOutputBytes = (8 * 1024 * 1024),
         [int]$MaxStandardErrorBytes = (1024 * 1024)
     )
@@ -416,6 +653,7 @@ function Invoke-BoundedProcess {
     $processStarted = $false
     $stdoutTask = $null
     $stderrTask = $null
+    $cleanupStopwatch = $null
     try {
         [void]$process.Start()
         $processStarted = $true
@@ -497,13 +735,27 @@ function Invoke-BoundedProcess {
             [string]::IsNullOrEmpty($limitExceeded) -and
             -not ($streamsCompleted -and $processExited))
         if ($timedOut -or -not [string]::IsNullOrEmpty($limitExceeded)) {
-            Stop-ProcessTreeBounded -Process $process
-            if (-not $process.HasExited -and -not $process.WaitForExit(5000)) {
-                throw "Child process did not exit after bounded tree termination: $FilePath"
+            $cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            Stop-ProcessTreeBounded `
+                -Process $process `
+                -CleanupStopwatch $cleanupStopwatch `
+                -CleanupDeadlineMilliseconds $CleanupDeadlineMilliseconds
+            $processExitWaitMilliseconds =
+                Get-RemainingCleanupWaitMilliseconds `
+                    -DeadlineMilliseconds $CleanupDeadlineMilliseconds `
+                    -ElapsedMilliseconds $cleanupStopwatch.ElapsedMilliseconds `
+                    -MaximumWaitMilliseconds 5000
+            if (-not $process.HasExited -and
+                ($processExitWaitMilliseconds -le 0 -or
+                    -not $process.WaitForExit(
+                        $processExitWaitMilliseconds))) {
+                throw 'bounded-process-cleanup-deadline-exceeded'
             }
             Complete-BoundedProcessStreams `
                 -Process $process `
-                -Tasks @($stdoutTask, $stderrTask)
+                -Tasks @($stdoutTask, $stderrTask) `
+                -CleanupStopwatch $cleanupStopwatch `
+                -CleanupDeadlineMilliseconds $CleanupDeadlineMilliseconds
         }
 
         [byte[]]$stdoutBytes = @()
@@ -528,28 +780,44 @@ function Invoke-BoundedProcess {
         }
     }
     catch {
-        $originalFailure = $_
-        $cleanupFailure = $null
         if ($processStarted) {
+            if ($null -eq $cleanupStopwatch) {
+                $cleanupStopwatch = (
+                    [System.Diagnostics.Stopwatch]::StartNew())
+            }
             try {
                 if (-not $process.HasExited) {
-                    Stop-ProcessTreeBounded -Process $process
-                    if (-not $process.HasExited -and -not $process.WaitForExit(5000)) {
-                        throw "Child process did not exit after bounded tree termination: $FilePath"
+                    Stop-ProcessTreeBounded `
+                        -Process $process `
+                        -CleanupStopwatch $cleanupStopwatch `
+                        -CleanupDeadlineMilliseconds `
+                            $CleanupDeadlineMilliseconds
+                    $cleanupProcessExitWaitMilliseconds =
+                        Get-RemainingCleanupWaitMilliseconds `
+                            -DeadlineMilliseconds `
+                                $CleanupDeadlineMilliseconds `
+                            -ElapsedMilliseconds `
+                                $cleanupStopwatch.ElapsedMilliseconds `
+                            -MaximumWaitMilliseconds 5000
+                    if (-not $process.HasExited -and
+                        ($cleanupProcessExitWaitMilliseconds -le 0 -or
+                            -not $process.WaitForExit(
+                                $cleanupProcessExitWaitMilliseconds))) {
+                        throw 'bounded-process-cleanup-deadline-exceeded'
                     }
                 }
                 Complete-BoundedProcessStreams `
                     -Process $process `
-                    -Tasks @($stdoutTask, $stderrTask)
+                    -Tasks @($stdoutTask, $stderrTask) `
+                    -CleanupStopwatch $cleanupStopwatch `
+                    -CleanupDeadlineMilliseconds `
+                        $CleanupDeadlineMilliseconds
             }
             catch {
-                $cleanupFailure = $_
+                # cleanup例外も外部のtext/pathを返さず、共通runner codeへ畳む。
             }
         }
-        if ($null -ne $cleanupFailure) {
-            throw $cleanupFailure
-        }
-        throw $originalFailure
+        throw 'bounded-process-runner-failed'
     }
     finally {
         $stdoutBuffer.Dispose()
@@ -1530,6 +1798,314 @@ exit 23
                     Join-Path $bootstrapCaseRoot 'Microsoft'))) {
             Add-Failure "Expected missing helper to fail closed before entrypoint body: $entrypointName"
         }
+    }
+
+    # child起動失敗のOS例外には合成absolute pathが入る。runner境界で固定codeへ
+    # 畳み、PowerShell 7 / 5.1のどちらでもexception textを反射しない。
+    $hostileRunnerPath = Join-Path $cacheProbeRoot (
+        'missing-runner-' +
+        [char]10 +
+        [char]0x202e +
+        [char]0x200b +
+        '.exe')
+    $runnerFailureCaught = $false
+    try {
+        [void](Invoke-BoundedProcess `
+                -FilePath $hostileRunnerPath `
+                -ArgumentList @() `
+                -Environment (Get-ProcessEnvironmentClone) `
+                -TimeoutSeconds 1)
+    }
+    catch {
+        $runnerFailureCaught = $true
+        $runnerFailureMessage = [string]$_.Exception.Message
+        if ($runnerFailureMessage -cne 'bounded-process-runner-failed' -or
+            $runnerFailureMessage.Contains($hostileRunnerPath)) {
+            Add-Failure (
+                'Expected a fixed anonymous runner failure without exception text.')
+        }
+    }
+    if (-not $runnerFailureCaught) {
+        Add-Failure 'Expected a missing executable to fail at the runner boundary.'
+    }
+
+    # 解決不能pathをPowerShell標準errorへ流すと、改行・bidi・zero-width文字が
+    # stderr framingを偽装できる。scanner以外のentrypointも固定byteだけを返す。
+    $hostileMissingRoot = (
+        'synthetic-missing-' +
+        [char]10 +
+        [char]0x202e +
+        [char]0x200b +
+        [char]0x2028 +
+        [char]0x2029 +
+        '-root')
+    $rootFailureCases = @(
+        [pscustomobject]@{
+            Entrypoint = 'test-scan-private-markers.ps1'
+            Diagnostic =
+                'Private marker self-test aborted: self-test-root-resolution-failed'
+        },
+        [pscustomobject]@{
+            Entrypoint = 'validate-oss-readiness.ps1'
+            Diagnostic =
+                'OSS readiness validation aborted: readiness-root-resolution-failed'
+        })
+    $invalidRootCases = @(
+        [pscustomobject]@{
+            Name = 'hostile-missing'
+            Value = $hostileMissingRoot
+        },
+        [pscustomobject]@{
+            Name = 'explicit-whitespace'
+            Value = '   '
+        },
+        [pscustomobject]@{
+            Name = 'explicit-empty'
+            Value = ''
+        })
+    # hosted PS5.1は同一host childのcold startだけで15秒を超える実測がある。
+    # invalid rootは本体前半で終わるため45秒、full readinessは90秒へ分離し、
+    # hangを有限に保ちながら正常なcold startをtimeout誤判定しない。
+    $rootFailureTimeoutSeconds = 45
+    $readinessSuccessTimeoutSeconds = 90
+    $rootDiagnosticPhaseStopwatch = (
+        [System.Diagnostics.Stopwatch]::StartNew())
+    $rootDiagnosticPhaseBudgetExhausted = $false
+    $rootDiagnosticPhaseBudgetFailure = (
+        'root-diagnostic-phase-budget-exhausted')
+    :invalidRootCaseLoop foreach ($invalidRootCase in $invalidRootCases) {
+        foreach ($rootFailureCase in $rootFailureCases) {
+            $rootFailureChildTimeoutSeconds =
+                Get-RemainingPhaseTimeoutSeconds `
+                    -RequestedTimeoutSeconds $rootFailureTimeoutSeconds `
+                    -PhaseBudgetSeconds $rootDiagnosticPhaseBudgetSeconds `
+                    -CleanupReserveSeconds `
+                        $rootDiagnosticCleanupReserveSeconds `
+                    -ElapsedMilliseconds `
+                        $rootDiagnosticPhaseStopwatch.ElapsedMilliseconds
+            if ($rootFailureChildTimeoutSeconds -le 0) {
+                Add-Failure $rootDiagnosticPhaseBudgetFailure
+                $rootDiagnosticPhaseBudgetExhausted = $true
+                break invalidRootCaseLoop
+            }
+
+            $rootFailureArguments = @('-NoProfile')
+            if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+                $rootFailureArguments += @('-ExecutionPolicy', 'Bypass')
+            }
+            $rootFailureArguments += @(
+                '-File',
+                (Join-Path $root "scripts/$($rootFailureCase.Entrypoint)"),
+                '-Path',
+                $invalidRootCase.Value)
+            $rootFailureEnvironment = New-ChildEnvironment `
+                -BaseEnvironment (Get-ProcessEnvironmentClone) `
+                -RemoveNames $moduleCacheIsolationEnvironmentNames `
+                -Overrides @{
+                    PSModuleAnalysisCachePath =
+                        'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+                }
+            $rootFailureResult = Invoke-BoundedProcess `
+                -FilePath $powerShellExecutable `
+                -ArgumentList $rootFailureArguments `
+                -Environment $rootFailureEnvironment `
+                -WorkingDirectory $cacheProbeRoot `
+                -TimeoutSeconds $rootFailureChildTimeoutSeconds `
+                -MaxStandardOutputBytes 128 `
+                -MaxStandardErrorBytes 128
+            [byte[]]$expectedRootFailureError = [Text.Encoding]::UTF8.GetBytes(
+                $rootFailureCase.Diagnostic + [char]10)
+            if ($rootFailureResult.ExitCode -ne 1 -or
+                $rootFailureResult.TimedOut -or
+                -not [string]::IsNullOrEmpty(
+                    $rootFailureResult.OutputLimitExceeded) -or
+                $rootFailureResult.StandardOutputBytes.Length -ne 0 -or
+                -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                    $rootFailureResult.StandardErrorBytes,
+                    $expectedRootFailureError) -or
+                (Test-Path -LiteralPath (
+                        Join-Path $cacheProbeRoot 'Microsoft'))) {
+                # case名とcontract状態だけを残し、host pathやraw outputは出さない。
+                Add-Failure (
+                    'Expected fixed root-resolution failure without raw path framing: ' +
+                    $rootFailureCase.Entrypoint +
+                    ':case=' + $invalidRootCase.Name +
+                    ':exit=' + [string]$rootFailureResult.ExitCode +
+                    ':timeout=' + [string]$rootFailureResult.TimedOut +
+                    ':limit=' +
+                    [string](-not [string]::IsNullOrEmpty(
+                            $rootFailureResult.OutputLimitExceeded)) +
+                    ':stdout-bytes=' +
+                    [string]$rootFailureResult.StandardOutputBytes.Length +
+                    ':stderr-bytes=' +
+                    [string]$rootFailureResult.StandardErrorBytes.Length)
+            }
+        }
+    }
+
+    if (-not $rootDiagnosticPhaseBudgetExhausted) {
+        $whitespaceScannerChildTimeoutSeconds =
+            Get-RemainingPhaseTimeoutSeconds `
+                -RequestedTimeoutSeconds 15 `
+                -PhaseBudgetSeconds $rootDiagnosticPhaseBudgetSeconds `
+                -CleanupReserveSeconds $rootDiagnosticCleanupReserveSeconds `
+                -ElapsedMilliseconds `
+                    $rootDiagnosticPhaseStopwatch.ElapsedMilliseconds
+        if ($whitespaceScannerChildTimeoutSeconds -le 0) {
+            Add-Failure $rootDiagnosticPhaseBudgetFailure
+            $rootDiagnosticPhaseBudgetExhausted = $true
+        }
+        else {
+            [byte[]]$expectedScannerRootFailure = (
+                [Text.Encoding]::UTF8.GetBytes(
+                    'Private marker scan aborted: scan-root-resolution-failed' +
+                    [char]10))
+            $whitespaceScannerResult = Invoke-Scanner `
+                -ScanPath '   ' `
+                -EnvironmentOverrides @{
+                    PSModuleAnalysisCachePath =
+                        'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+                } `
+                -RemoveEnvironmentNames $moduleCacheIsolationEnvironmentNames `
+                -TimeoutSeconds $whitespaceScannerChildTimeoutSeconds `
+                -MaxStandardOutputBytes 128 `
+                -MaxStandardErrorBytes 128
+            if ($whitespaceScannerResult.ExitCode -ne 1 -or
+                $whitespaceScannerResult.TimedOut -or
+                -not [string]::IsNullOrEmpty(
+                    $whitespaceScannerResult.OutputLimitExceeded) -or
+                -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                    $whitespaceScannerResult.StandardOutputBytes,
+                    $expectedScannerRootFailure) -or
+                $whitespaceScannerResult.StandardErrorBytes.Length -ne 0) {
+                Add-Failure (
+                    'Expected explicit whitespace scanner root to fail closed.')
+            }
+        }
+    }
+
+    # readiness成功時も解決済みrootを再掲しない。所有linkの名前にbidiと
+    # zero-width文字を含め、出力全体をpath-freeの固定byteと比較する。
+    if (-not $rootDiagnosticPhaseBudgetExhausted) {
+        $readinessChildTimeoutSeconds =
+            Get-RemainingPhaseTimeoutSeconds `
+                -RequestedTimeoutSeconds $readinessSuccessTimeoutSeconds `
+                -PhaseBudgetSeconds $rootDiagnosticPhaseBudgetSeconds `
+                -CleanupReserveSeconds $rootDiagnosticCleanupReserveSeconds `
+                -ElapsedMilliseconds `
+                    $rootDiagnosticPhaseStopwatch.ElapsedMilliseconds
+        if ($readinessChildTimeoutSeconds -le 0) {
+            Add-Failure $rootDiagnosticPhaseBudgetFailure
+            $rootDiagnosticPhaseBudgetExhausted = $true
+        }
+        else {
+            $hostileReadinessAlias = Join-Path $cacheProbeRoot (
+                'valid-' + [char]0x202e + [char]0x200b + '-root')
+            try {
+                if ($script:isWindowsRuntime) {
+                    [void](New-Item `
+                        -ItemType Junction `
+                        -Path $hostileReadinessAlias `
+                        -Target $root `
+                        -ErrorAction Stop)
+                }
+                else {
+                    [void](New-Item `
+                        -ItemType SymbolicLink `
+                        -Path $hostileReadinessAlias `
+                        -Target $root `
+                        -ErrorAction Stop)
+                }
+                $readinessArguments = @('-NoProfile')
+                if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+                    $readinessArguments += @('-ExecutionPolicy', 'Bypass')
+                }
+                $readinessArguments += @(
+                    '-File',
+                    (Join-Path $root 'scripts/validate-oss-readiness.ps1'),
+                    '-Path',
+                    $hostileReadinessAlias)
+                $readinessEnvironment = New-ChildEnvironment `
+                    -BaseEnvironment (Get-ProcessEnvironmentClone) `
+                    -RemoveNames $moduleCacheIsolationEnvironmentNames `
+                    -Overrides @{
+                        PSModuleAnalysisCachePath =
+                            'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+                    }
+                # link作成とargument準備もphase経過へ含め、child直前に残時間を再計算する。
+                $readinessChildTimeoutSeconds =
+                    Get-RemainingPhaseTimeoutSeconds `
+                        -RequestedTimeoutSeconds `
+                            $readinessSuccessTimeoutSeconds `
+                        -PhaseBudgetSeconds `
+                            $rootDiagnosticPhaseBudgetSeconds `
+                        -CleanupReserveSeconds `
+                            $rootDiagnosticCleanupReserveSeconds `
+                        -ElapsedMilliseconds `
+                            $rootDiagnosticPhaseStopwatch.ElapsedMilliseconds
+                if ($readinessChildTimeoutSeconds -le 0) {
+                    Add-Failure $rootDiagnosticPhaseBudgetFailure
+                    $rootDiagnosticPhaseBudgetExhausted = $true
+                }
+                else {
+                    $readinessResult = Invoke-BoundedProcess `
+                        -FilePath $powerShellExecutable `
+                        -ArgumentList $readinessArguments `
+                        -Environment $readinessEnvironment `
+                        -WorkingDirectory $cacheProbeRoot `
+                        -TimeoutSeconds $readinessChildTimeoutSeconds `
+                        -MaxStandardOutputBytes 128 `
+                        -MaxStandardErrorBytes 128
+                    [byte[]]$expectedReadinessSuccess = (
+                        [Text.Encoding]::UTF8.GetBytes(
+                            'OSS readiness validation passed.' +
+                            [char]10))
+                    if ($readinessResult.ExitCode -ne 0 -or
+                        $readinessResult.TimedOut -or
+                        -not [string]::IsNullOrEmpty(
+                            $readinessResult.OutputLimitExceeded) -or
+                        -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                            $readinessResult.StandardOutputBytes,
+                            $expectedReadinessSuccess) -or
+                        $readinessResult.StandardErrorBytes.Length -ne 0) {
+                        # raw outputは再掲せず、timeout等を匿名metadataで判別する。
+                        Add-Failure (
+                            'Expected readiness success output to omit the resolved root:' +
+                            'exit=' + [string]$readinessResult.ExitCode +
+                            ':timeout=' + [string]$readinessResult.TimedOut +
+                            ':limit=' +
+                            [string](-not [string]::IsNullOrEmpty(
+                                    $readinessResult.OutputLimitExceeded)) +
+                            ':stdout-bytes=' +
+                            [string]$readinessResult.StandardOutputBytes.Length +
+                            ':stderr-bytes=' +
+                            [string]$readinessResult.StandardErrorBytes.Length)
+                    }
+                }
+            }
+            catch {
+                Add-Failure (
+                    'Expected a hostile-name junction or symlink fixture for readiness output.')
+            }
+            finally {
+                if (Test-Path -LiteralPath $hostileReadinessAlias) {
+                    if ($script:isWindowsRuntime) {
+                        [IO.Directory]::Delete(
+                            $hostileReadinessAlias,
+                            $false)
+                    }
+                    else {
+                        [IO.File]::Delete($hostileReadinessAlias)
+                    }
+                }
+            }
+        }
+    }
+
+    $rootDiagnosticPhaseStopwatch.Stop()
+    if ($rootDiagnosticPhaseStopwatch.Elapsed.TotalSeconds -gt
+        $rootDiagnosticPhaseBudgetSeconds) {
+        Add-Failure 'root-diagnostic-phase-budget-overrun'
     }
 
     # 明示scan target自体や、それを指すjunction/symlinkをambient tempにしても、
@@ -2609,20 +3185,35 @@ You can also write C:\Users\<name>\project to describe a user directory.
     }
 
     # self-test helper 自身も同じ pipe 条件を有限時間で回収する。
+    # 小さいtest-only deadlineでも、timeoutと全cleanupがdeadlineから大幅に
+    # はみ出さないことを実時間で検査する。
     $helperPipeReport = Join-Path $artifactRoot 'helper-pipe-report.txt'
     $helperEnvironment = New-ChildEnvironment `
         -BaseEnvironment (Get-ProcessEnvironmentClone) `
         -Overrides @{
             SCANNER_TEST_REPORT = $helperPipeReport
         }
-    $helperStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $helperPipeResult = Invoke-BoundedProcess `
-        -FilePath $wrapperPath `
-        -ArgumentList @('--hold-pipe-direct') `
-        -Environment $helperEnvironment `
-        -TimeoutSeconds 2
-    if (-not $helperPipeResult.TimedOut -or $helperStopwatch.Elapsed.TotalSeconds -gt 12) {
-        Add-Failure 'Expected self-test helper descendant pipe to time out and clean up within 12 seconds.'
+    $boundedProcessCommand = Get-Command `
+        -Name 'Invoke-BoundedProcess' `
+        -CommandType Function
+    if (-not $boundedProcessCommand.Parameters.ContainsKey(
+            'CleanupDeadlineMilliseconds')) {
+        Add-Failure 'Expected an explicit bounded-process cleanup deadline.'
+    }
+    else {
+        $helperStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $helperPipeResult = Invoke-BoundedProcess `
+            -FilePath $wrapperPath `
+            -ArgumentList @('--hold-pipe-direct') `
+            -Environment $helperEnvironment `
+            -TimeoutSeconds 2 `
+            -CleanupDeadlineMilliseconds 2000
+        $helperStopwatch.Stop()
+        if (-not $helperPipeResult.TimedOut -or
+            $helperStopwatch.Elapsed.TotalSeconds -gt 5) {
+            Add-Failure (
+                'Expected timeout and all cleanup to honor the shared deadline.')
+        }
     }
     Assert-RecordedProcessesExited -ReportPath $helperPipeReport -Phase 'self-test descendant-pipe timeout'
     Remove-Item -LiteralPath $helperPipeReport -ErrorAction SilentlyContinue
