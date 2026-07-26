@@ -8,6 +8,13 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Hardened all three PowerShell entrypoints so omitted `-Path` still selects the
+  repository root while explicit empty, whitespace-only, missing, or otherwise
+  unresolvable roots fail closed with entrypoint-specific fixed UTF-8
+  diagnostics. Readiness success no longer replays the resolved host path.
+- Added bounded PowerShell 7 and Windows PowerShell 5.1 regressions for hostile
+  missing roots, whitespace-only explicit roots, and path-free readiness
+  success through an owned hostile-name junction or symlink.
 - Disabled the module-analysis cache at all PowerShell validation/scanner
   entrypoints with Microsoft's platform null-device values (`NUL` on Windows,
   `/dev/null` elsewhere), then relaunched the same host once so the child

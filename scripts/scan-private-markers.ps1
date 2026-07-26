@@ -5,6 +5,10 @@ param(
     [int]$GitCommandTimeoutSeconds = 15
 )
 
+# 明示した空文字/空白pathを「省略」と混同しない。PSBoundParametersの確認は
+# .NET dictionary methodだけなので、module cache bootstrap前にも安全である。
+$pathWasSpecified = $PSBoundParameters.ContainsKey('Path')
+
 # ambient markerだけで再実行をskipさせない。上書き前の marker/sink pair を
 # .NETだけでcaptureし、childが起動前から正しいpairを持つ場合だけ受理する。
 $moduleCacheBootstrapOriginalMarker =
@@ -69,7 +73,7 @@ catch {
 $moduleCacheArguments = @(
     '-GitCommandTimeoutSeconds',
     [string]$GitCommandTimeoutSeconds)
-if (-not [string]::IsNullOrWhiteSpace($Path)) {
+if ($pathWasSpecified) {
     $moduleCacheArguments += @('-Path', $Path)
 }
 try {
@@ -93,7 +97,7 @@ if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 
-if ([string]::IsNullOrWhiteSpace($Path)) {
+if (-not $pathWasSpecified) {
     $Path = Split-Path -Parent $scriptRoot
 }
 
@@ -101,6 +105,9 @@ if ([string]::IsNullOrWhiteSpace($Path)) {
 # raw path内の改行・bidi・zero-width文字がterminal診断を偽装できる。
 # 生例外を一切表示せず、固定codeだけでfail closedにする。
 try {
+    if ($pathWasSpecified -and [string]::IsNullOrWhiteSpace($Path)) {
+        throw 'scan-root-invalid'
+    }
     $root = (
         Resolve-Path `
             -LiteralPath $Path `

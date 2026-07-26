@@ -303,12 +303,19 @@ has started most recently without printing paths, fixture content, or
 environment values. Local callers can opt in with the same environment flag
 when diagnosing a bounded self-test run.
 
-For a Git repository, pass the exact repository root. The scanner rejects a
-repository subdirectory instead of silently changing scope. A missing or
-otherwise unresolvable root returns only the fixed
-`scan-root-resolution-failed` code; it never echoes the supplied path or raw
-PowerShell error framing. The scanner scans each stage-0 regular file from
-both its index blob and existing worktree path with distinct provenance.
+For a Git repository, pass the exact repository root. All three entry scripts
+distinguish an omitted `-Path` from an explicitly empty or whitespace-only
+value: omission selects the repository root, while an invalid explicit scope
+fails closed instead of silently falling back. Missing or otherwise
+unresolvable roots return only the fixed `scan-root-resolution-failed`,
+`self-test-root-resolution-failed`, or `readiness-root-resolution-failed`
+code for the relevant entrypoint; they never echo the supplied path or raw
+PowerShell error framing. Readiness success is also the path-free fixed line
+`OSS readiness validation passed.`. The design and synthetic compatibility
+record are in
+[docs/hostile-root-diagnostic-hardening.md](docs/hostile-root-diagnostic-hardening.md).
+The scanner scans each stage-0 regular file from both its index blob and
+existing worktree path with distinct provenance.
 Sensitive text candidates include dotenv names
 (`.env`, `.env.*`, and `*.env`), PEM/key/config extensions, ordinary source
 and documentation extensions, and extensionless files; other extensions are

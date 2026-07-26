@@ -73,6 +73,26 @@ precedes module discovery. A profile or long-lived embedded host that already
 performed module discovery before invoking the script is outside this
 bootstrap guarantee; start a fresh documented CLI process in that case.
 
+## Entrypoint Root Diagnostic Boundary
+
+The scanner, its self-test, and the readiness validator distinguish an omitted
+`-Path` from an explicitly empty or whitespace-only value. Only omission may
+select the repository root. An invalid explicit scope fails closed before the
+entrypoint can silently inspect a different tree.
+
+Root-resolution failure emits only the entrypoint-specific
+`scan-root-resolution-failed`, `self-test-root-resolution-failed`, or
+`readiness-root-resolution-failed` code on its documented stream. Raw supplied
+paths, resolved paths, control or Format characters, and PowerShell error
+framing are not replayed. Readiness success is likewise a path-free fixed
+UTF-8 line rather than a resolved host path.
+
+Synthetic bounded fixtures exercise hostile missing roots, whitespace-only
+explicit roots, and a validator success path reached through an owned
+hostile-name junction or symlink under both supported Windows PowerShell
+hosts. They neither create nor delete a real Git lock and do not inspect or
+modify another process's lock.
+
 ## Scanner Coverage
 
 The private-marker scanner (`scripts/scan-private-markers.ps1`) is a
@@ -95,15 +115,12 @@ redirection, config injection, tracing, prompts, and user-level Git config.
 The scanner requires the exact repository root and fails closed on malformed
 index/probe output, conflict or intent-to-add stages, gitlinks, symlinks,
 missing/reparse-point or concurrently changed worktree files, and path
-escape. Root resolution failure emits only
-`scan-root-resolution-failed`; hostile missing paths containing control,
-Format, bidi, zero-width, or line-separator characters are never replayed
-through raw PowerShell error framing. A tracked `.private-markers.local` is
-rejected without printing its contents. It clones rather than mutates its
-parent environment, starts each Git command with a finite process-and-pipe
-deadline, disables replacement objects and lazy promisor fetches, and
-enforces per-stream, per-file, entry-count, line-count, finding-count,
-local-marker, and total-text limits.
+escape. The root diagnostic follows the shared entrypoint boundary above. A
+tracked `.private-markers.local` is rejected without printing its contents. It
+clones rather than mutates its parent environment, starts each Git command with
+a finite process-and-pipe deadline, disables replacement objects and lazy
+promisor fetches, and enforces per-stream, per-file, entry-count, line-count,
+finding-count, local-marker, and total-text limits.
 The concrete index layers are capped at 100,000 stage entries, 8,192 text
 entries, 4 MiB per text file, 64 MiB combined text, and 16 MiB for each raw
 index-debug listing. Non-Git fallback enumerates hidden files and explicitly

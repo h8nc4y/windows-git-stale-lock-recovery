@@ -3,6 +3,10 @@ param(
     [string]$Path = ''
 )
 
+# 明示した空文字/空白pathをdefault rootへ置換しない。合成invalid scopeも
+# childへそのまま転送し、固定root-resolution codeでfail closedにする。
+$pathWasSpecified = $PSBoundParameters.ContainsKey('Path')
+
 $moduleCacheBootstrapOriginalMarker =
     [Environment]::GetEnvironmentVariable(
         'WINDOWS_GIT_STALE_LOCK_RECOVERY_MODULE_CACHE_ISOLATED')
@@ -63,7 +67,7 @@ catch {
     exit 1
 }
 $moduleCacheArguments = @()
-if (-not [string]::IsNullOrWhiteSpace($Path)) {
+if ($pathWasSpecified) {
     $moduleCacheArguments += @('-Path', $Path)
 }
 try {
@@ -87,11 +91,38 @@ if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 
-if ([string]::IsNullOrWhiteSpace($Path)) {
+if (-not $pathWasSpecified) {
     $Path = Split-Path -Parent $scriptRoot
 }
 
-$root = (Resolve-Path -LiteralPath $Path).Path
+# raw pathをPowerShell標準error framingへ流さず、固定UTF-8 codeだけを返す。
+try {
+    if ($pathWasSpecified -and [string]::IsNullOrWhiteSpace($Path)) {
+        throw 'self-test-root-invalid'
+    }
+    $root = (
+        Resolve-Path `
+            -LiteralPath $Path `
+            -ErrorAction Stop
+    ).Path
+}
+catch {
+    [byte[]]$rootFailureBytes = [Text.Encoding]::UTF8.GetBytes(
+        'Private marker self-test aborted: self-test-root-resolution-failed' +
+        [char]10)
+    $rootFailureOutput = [Console]::OpenStandardError()
+    try {
+        $rootFailureOutput.Write(
+            $rootFailureBytes,
+            0,
+            $rootFailureBytes.Length)
+        $rootFailureOutput.Flush()
+    }
+    finally {
+        $rootFailureOutput.Dispose()
+    }
+    exit 1
+}
 $scanner = Join-Path $root 'scripts/scan-private-markers.ps1'
 if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
     throw "Missing scanner script: $scanner"
@@ -1529,6 +1560,167 @@ exit 23
             (Test-Path -LiteralPath (
                     Join-Path $bootstrapCaseRoot 'Microsoft'))) {
             Add-Failure "Expected missing helper to fail closed before entrypoint body: $entrypointName"
+        }
+    }
+
+    # 解決不能pathをPowerShell標準errorへ流すと、改行・bidi・zero-width文字が
+    # stderr framingを偽装できる。scanner以外のentrypointも固定byteだけを返す。
+    $hostileMissingRoot = (
+        'synthetic-missing-' +
+        [char]10 +
+        [char]0x202e +
+        [char]0x200b +
+        [char]0x2028 +
+        [char]0x2029 +
+        '-root')
+    $rootFailureCases = @(
+        [pscustomobject]@{
+            Entrypoint = 'test-scan-private-markers.ps1'
+            Diagnostic =
+                'Private marker self-test aborted: self-test-root-resolution-failed'
+        },
+        [pscustomobject]@{
+            Entrypoint = 'validate-oss-readiness.ps1'
+            Diagnostic =
+                'OSS readiness validation aborted: readiness-root-resolution-failed'
+        })
+    foreach ($invalidRoot in @($hostileMissingRoot, '   ', '')) {
+        foreach ($rootFailureCase in $rootFailureCases) {
+            $rootFailureArguments = @('-NoProfile')
+            if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+                $rootFailureArguments += @('-ExecutionPolicy', 'Bypass')
+            }
+            $rootFailureArguments += @(
+                '-File',
+                (Join-Path $root "scripts/$($rootFailureCase.Entrypoint)"),
+                '-Path',
+                $invalidRoot)
+            $rootFailureEnvironment = New-ChildEnvironment `
+                -BaseEnvironment (Get-ProcessEnvironmentClone) `
+                -RemoveNames $moduleCacheIsolationEnvironmentNames `
+                -Overrides @{
+                    PSModuleAnalysisCachePath =
+                        'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+                }
+            $rootFailureResult = Invoke-BoundedProcess `
+                -FilePath $powerShellExecutable `
+                -ArgumentList $rootFailureArguments `
+                -Environment $rootFailureEnvironment `
+                -WorkingDirectory $cacheProbeRoot `
+                -TimeoutSeconds 15 `
+                -MaxStandardOutputBytes 128 `
+                -MaxStandardErrorBytes 128
+            [byte[]]$expectedRootFailureError = [Text.Encoding]::UTF8.GetBytes(
+                $rootFailureCase.Diagnostic + [char]10)
+            if ($rootFailureResult.ExitCode -ne 1 -or
+                $rootFailureResult.TimedOut -or
+                -not [string]::IsNullOrEmpty(
+                    $rootFailureResult.OutputLimitExceeded) -or
+                $rootFailureResult.StandardOutputBytes.Length -ne 0 -or
+                -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                    $rootFailureResult.StandardErrorBytes,
+                    $expectedRootFailureError) -or
+                (Test-Path -LiteralPath (
+                        Join-Path $cacheProbeRoot 'Microsoft'))) {
+                Add-Failure (
+                    'Expected fixed root-resolution failure without raw path framing: ' +
+                    $rootFailureCase.Entrypoint)
+            }
+        }
+    }
+
+    [byte[]]$expectedScannerRootFailure = [Text.Encoding]::UTF8.GetBytes(
+        'Private marker scan aborted: scan-root-resolution-failed' +
+        [char]10)
+    $whitespaceScannerResult = Invoke-Scanner `
+        -ScanPath '   ' `
+        -EnvironmentOverrides @{
+            PSModuleAnalysisCachePath =
+                'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+        } `
+        -RemoveEnvironmentNames $moduleCacheIsolationEnvironmentNames `
+        -TimeoutSeconds 15 `
+        -MaxStandardOutputBytes 128 `
+        -MaxStandardErrorBytes 128
+    if ($whitespaceScannerResult.ExitCode -ne 1 -or
+        $whitespaceScannerResult.TimedOut -or
+        -not [string]::IsNullOrEmpty(
+            $whitespaceScannerResult.OutputLimitExceeded) -or
+        -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+            $whitespaceScannerResult.StandardOutputBytes,
+            $expectedScannerRootFailure) -or
+        $whitespaceScannerResult.StandardErrorBytes.Length -ne 0) {
+        Add-Failure 'Expected explicit whitespace scanner root to fail closed.'
+    }
+
+    # readiness成功時も解決済みrootを再掲しない。所有linkの名前にbidiと
+    # zero-width文字を含め、出力全体をpath-freeの固定byteと比較する。
+    $hostileReadinessAlias = Join-Path $cacheProbeRoot (
+        'valid-' + [char]0x202e + [char]0x200b + '-root')
+    try {
+        if ($script:isWindowsRuntime) {
+            [void](New-Item `
+                -ItemType Junction `
+                -Path $hostileReadinessAlias `
+                -Target $root `
+                -ErrorAction Stop)
+        }
+        else {
+            [void](New-Item `
+                -ItemType SymbolicLink `
+                -Path $hostileReadinessAlias `
+                -Target $root `
+                -ErrorAction Stop)
+        }
+        $readinessArguments = @('-NoProfile')
+        if ((Split-Path -Leaf $powerShellExecutable) -like 'powershell*') {
+            $readinessArguments += @('-ExecutionPolicy', 'Bypass')
+        }
+        $readinessArguments += @(
+            '-File',
+            (Join-Path $root 'scripts/validate-oss-readiness.ps1'),
+            '-Path',
+            $hostileReadinessAlias)
+        $readinessEnvironment = New-ChildEnvironment `
+            -BaseEnvironment (Get-ProcessEnvironmentClone) `
+            -RemoveNames $moduleCacheIsolationEnvironmentNames `
+            -Overrides @{
+                PSModuleAnalysisCachePath =
+                    'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+            }
+        $readinessResult = Invoke-BoundedProcess `
+            -FilePath $powerShellExecutable `
+            -ArgumentList $readinessArguments `
+            -Environment $readinessEnvironment `
+            -WorkingDirectory $cacheProbeRoot `
+            -TimeoutSeconds 15 `
+            -MaxStandardOutputBytes 128 `
+            -MaxStandardErrorBytes 128
+        [byte[]]$expectedReadinessSuccess = [Text.Encoding]::UTF8.GetBytes(
+            'OSS readiness validation passed.' +
+            [char]10)
+        if ($readinessResult.ExitCode -ne 0 -or
+            $readinessResult.TimedOut -or
+            -not [string]::IsNullOrEmpty(
+                $readinessResult.OutputLimitExceeded) -or
+            -not [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+                $readinessResult.StandardOutputBytes,
+                $expectedReadinessSuccess) -or
+            $readinessResult.StandardErrorBytes.Length -ne 0) {
+            Add-Failure 'Expected readiness success output to omit the resolved root.'
+        }
+    }
+    catch {
+        Add-Failure 'Expected a hostile-name junction or symlink fixture for readiness output.'
+    }
+    finally {
+        if (Test-Path -LiteralPath $hostileReadinessAlias) {
+            if ($script:isWindowsRuntime) {
+                [IO.Directory]::Delete($hostileReadinessAlias, $false)
+            }
+            else {
+                [IO.File]::Delete($hostileReadinessAlias)
+            }
         }
     }
 
