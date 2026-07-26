@@ -54,7 +54,42 @@ readinessは成功時も解決済みrootをそのままstdoutへ表示する。
   output limitを比較する。
 - hostile名の所有junction / symlink経由でreadiness成功経路を実行し、
   path-freeの固定出力を比較する。
+- hosted Windows PowerShell 5.1のcold start実測に合わせ、invalid-root childは
+  最大45秒、full-readiness childは最大90秒にする。すべてのroot診断fixtureを
+  210秒の累積phaseへ入れ、経過時間から次childの残時間を減らし、20秒を
+  process-tree / pipe cleanup用に予約する。残時間がなければ固定codeで早期失敗
+  する。失敗時はcase名、exit、timeout、output-limit、stream byte数だけを
+  表示し、raw pathやraw outputは再掲しない。
+- child timeout後のtree termination、process-exit、retry、pipe waitは、
+  それぞれに新しい上限を与えず、共有absolute 20-second cleanup deadlineの
+  残時間だけを使う。runner startとcleanupの例外は
+  `bounded-process-runner-failed`へ畳み、executable pathやplatform exception
+  textを反射しない。
 - PowerShell 7とWindows PowerShell 5.1でreadiness、full self-test、
   actual scannerを実行する。
 - private-marker scan、Semgrep、Gitleaks、UTF-8/BOM/LF/NUL、
   `git diff --check`を実行する。
+
+## Hosted runner実測
+
+CI envelope evidence: job=29m44s; self-test step=28m40s; readiness step=51s;
+scanner step=skipped; direct cause=unconfirmed.
+
+[GitHub Actions run 30201021219](https://github.com/h8nc4y/windows-git-stale-lock-recovery/actions/runs/30201021219)
+のWindows PowerShell 5.1では、job全体が29分44秒、self-test stepが
+28分40秒、readiness stepが約51秒で、後続scanner stepはskippedだった。
+新規childを15秒で打ち切った初回runは、root failure 2件とpath-free
+readiness成功1件を誤判定した。旧diagnosticはtimeout flagを出して
+いなかったため各失敗の直接原因は未確認（direct cause: unconfirmed）だが、
+standalone readiness実測とmodule-cache phaseの時間増加はcold-start
+deadline不足と整合する。
+
+Windows PowerShell 5.1のjob deadlineは35分（2,100秒）である。attempt 1の
+job全体1,784秒に、旧invalid/readiness fixture上限105秒から新累積上限
+210秒への増分105秒と、変更していない製品scannerの最大6 child × 15秒 =
+90秒を加えると1,979秒（32分59秒）になる。job deadlineまで121秒を残す。
+runtime計算とreadinessのstatic gateは、この210秒phase、20秒cleanup reserve、
+製品scannerの6-by-15-second契約、1,979秒envelopeを固定する。新diagnosticは
+次回失敗時に匿名timeout状態を残す。残り121秒のうち最低120秒は、実scanner
+stepのsetup、bounded cleanup、その他job overhead用のreserveとして
+runtimeでも検査する。

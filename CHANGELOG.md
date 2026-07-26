@@ -14,7 +14,13 @@ The format loosely follows Keep a Changelog conventions.
   diagnostics. Readiness success no longer replays the resolved host path.
 - Added bounded PowerShell 7 and Windows PowerShell 5.1 regressions for hostile
   missing roots, whitespace-only explicit roots, and path-free readiness
-  success through an owned hostile-name junction or symlink.
+  success through an owned hostile-name junction or symlink. Hosted PS5.1
+  invalid-root and full-readiness children use separate 45-second and
+  90-second cold-start allowances inside a 210-second cumulative phase budget
+  with remaining-time child deadlines and a 20-second cleanup reserve. Every
+  tree-termination, process-exit, retry, and pipe wait consumes one shared
+  absolute cleanup deadline; runner and cleanup exceptions collapse to a
+  fixed anonymous failure code without replaying an executable path.
 - Disabled the module-analysis cache at all PowerShell validation/scanner
   entrypoints with Microsoft's platform null-device values (`NUL` on Windows,
   `/dev/null` elsewhere), then relaunched the same host once so the child
