@@ -91,7 +91,9 @@ Microsoft の仕様どおり、確実な起動前設定は新しい child proces
 - PR run `30150242288`: PowerShell 7 / Ubuntu はPASS。Windows PowerShell
   5.1 は全 phaseを完了した後、primary probeの30秒上限によりraw streamと
   parent/child reportの2 assertionがFAIL。上限をbounded 120秒へ変更し、
-  redacted診断と合成timeout failure fixtureを追加した。修正後CIは未確認。
+  redacted診断と合成timeout failure fixtureを追加した。
+- 修正後の[PR run `30152193836`](https://github.com/h8nc4y/windows-git-stale-lock-recovery/actions/runs/30152193836)は、PowerShell 7、Windows PowerShell 5.1、Ubuntuの全jobがPASS。
+- merge後の[main run `30153023795`](https://github.com/h8nc4y/windows-git-stale-lock-recovery/actions/runs/30153023795)も、同じ3 jobがPASS。
 
 ## 出典
 
