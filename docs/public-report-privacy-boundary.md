@@ -72,4 +72,13 @@ credential-bearing remote URLなどを漏らす可能性がある。
   in-memory negative mutationをvalidatorへ追加した。
 - 再reviewはchecklistだけkeyword順検査が残るP2を検出した。同じexact semantic
   contractへ統一し、raw evidence公開と`only`反転のnegative mutationを追加した。
-- GitHub Actions、PR、merge後のdefault branchはこの時点では未確認。
+- [PR run `30241358785`](https://github.com/h8nc4y/windows-git-stale-lock-recovery/actions/runs/30241358785)と[merge後のmain run `30241473430`](https://github.com/h8nc4y/windows-git-stale-lock-recovery/actions/runs/30241473430)は、PowerShell 7、Windows PowerShell 5.1、Ubuntuの全jobがPASS。
+
+## CI完了前にマージした手順誤り
+
+- PR #5で`gh pr merge --merge --auto`を実行したところ、required checksが設定されていなかったため、CIの完了前に即時マージされた。
+- CI待機に`--auto`を使った判断は手順誤りだった。
+- このリポジトリでは`--auto`をCI待機の代替にしない。
+- PRのすべてのcheckが成功したことを実測してから、通常の`gh pr merge --merge`を実行する。
+- マージ後のdefault branch CIも終端まで確認する。
+- 失敗した場合は、原因を限定したhotfix PRを直ちに作成する。
