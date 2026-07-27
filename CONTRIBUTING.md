@@ -139,3 +139,10 @@ pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 Prefer documentation and validation that prevent wrong deletions. Avoid
 adding broad dependencies or network-backed checks unless they are clearly
 necessary for public safety.
+
+Do not use `gh pr merge --auto` as a substitute for observing CI to
+completion. If required checks are not configured, GitHub can merge
+immediately while jobs are still running. Confirm that every expected pull
+request check has completed successfully, then use the ordinary
+`gh pr merge --merge` command. Observe the resulting default-branch run to
+completion too; if it fails, create a focused hotfix pull request immediately.
