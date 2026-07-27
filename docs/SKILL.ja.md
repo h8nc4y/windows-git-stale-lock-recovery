@@ -37,7 +37,9 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
 
    エージェントアプリ（例: Codex アプリ）由来の短命 `git status` が頻出することが
    ある。index を書く操作（add / commit / merge / checkout 等）のコマンドラインが
-   **無い**ことを確認する。
+   **無い**ことを確認する。raw process一覧はlocal/private evidenceとして扱う。
+   command lineにはprivate pathやcredential-bearing remote URLが含まれ得るため、
+   public/external reportへraw command lineを貼らない。
 3. **lock ファイルの実体を確認**。
    - PowerShell: `Get-Item -LiteralPath '<repo>\.git\index.lock' | Select-Object FullName,Length,LastWriteTime`
    - Git Bash: `ls -l <repo>/.git/index.lock`
@@ -93,6 +95,7 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
 
    ```powershell
    # 例（この一括コマンド自体の実行実績は未確認。実績は repo ごとの個別削除）
+   # このblockのpath付き出力はすべてlocal/private audit用。外部共有前にsanitizeする
    Get-CimInstance Win32_Process -Filter "Name='git.exe'"   # 出力なし＝この時点で git 不在（開始時スナップショット）
    Get-ChildItem <workspace-root>\*\.git\index.lock -ErrorAction SilentlyContinue |
      Where-Object { $_.Length -eq 0 -and $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } |
@@ -102,7 +105,7 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
          # 条件5: lock 1件ごとの排他 open テスト。開けない lock は他プロセス保持とみなしスキップ
          $f = [IO.File]::Open($lock.FullName,'Open','Read','None'); $f.Close()
          Remove-Item -LiteralPath $lock.FullName -Confirm:$false
-         $lock.FullName   # 削除した lock を報告用に出力
+         $lock.FullName   # 削除したlockをlocal/private audit用にだけ出力
        } catch {
          Write-Warning "Skipped (exclusive open or delete failed; no forced delete, no retry): $($lock.FullName)"
        }
@@ -118,8 +121,10 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
      「現行作業より前の lock だけを消す」こと。
    - 一括掃除でも5点チェックは lock 1件ごとに適用する。条件2（意図した repo 配下）
      は glob パターン `<workspace-root>\*\.git\index.lock`（repo 直下の `.git` のみ
-     に一致）で代替しているので、削除した lock のフルパスを列挙して報告し、代替
-     した旨を明記する。
+     に一致）で代替しているので、削除した lock のフルパスをlocal audit recordへ
+     列挙し、代替した旨を明記する。
+   - 一括掃除のfull-path outputはlocal/private audit用である。public/externalへ
+     共有する前に、各pathを`<repo>/.git/index.lock`のようなplaceholderへ置換する。
 
 ## 安全条件
 
@@ -137,24 +142,26 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
 - 5点のうち1つでも欠けたら削除しない。上限付きで再確認する（例: ブロックされて
   いた git 操作の再試行は2〜3回まで、都度5点チェックをやり直す。無期限待機・
   foreground sleep・「自然解消を待つ」放置は行わない）。同一失敗クラスが3回試して
-  も改善しなければ、停止して状況を報告する。
+  も改善しなければ停止し、下記のsanitized boundaryで状況を報告する。
 - 削除対象は当該 lock ファイル**のみ**。`.git/index` / `.git/config` 本体やその他
   の `.git` 内容には触れない。
 - プロセスの強制終了・sandbox の解除（unsandbox 化）はこの skill の範囲外として
   実施しない。kill が必要に見えても人間の判断待ちで停止せず、状況（プロセス ID・
-  コマンドライン・lock のパス/サイズ/mtime）を報告に残したうえで、直列化や上限
-  付き再確認など kill 不要の代替で継続する。3回試しても改善しなければ停止して
-  報告する。
+  コマンドライン・lock のパス/サイズ/mtime）をlocal/private evidenceへ残したうえ
+  で、直列化や上限付き再確認など kill 不要の代替で継続する。3回試しても改善しな
+  ければ停止し、下記のsanitized boundaryで報告する。
 - 一括掃除でも5点チェックは lock 1件ごとに適用する。条件1のプロセス確認は開始時
   スナップショットにすぎないため、mtime フィルタと lock ごとの排他 open（条件5）
-  を必須とし、排他 open や `Remove-Item` に失敗した lock はスキップして報告する
-  （強制削除・リトライ禁止）。5点チェックの一部をフィルタで代替した場合は、代替
-  した条件を報告に明記する。
+  を必須とし、排他 open や `Remove-Item` に失敗した lock はスキップする
+  （強制削除・リトライ禁止）。実pathはlocalに保持し、報告ではsanitized placeholder
+  と理由だけを記載する。5点チェックの一部をフィルタで代替した場合は、代替した
+  条件を報告に明記する。
 - 0 bytes でない lock は原則削除しない。index と同サイズの lock が完了済み操作後
   に残った実測はある（field-tested）が、その場合も残り4条件と直前操作の完了を
   確認できたときのみ削除する。
-- 同じ失敗が3回改善しなければ停止し、lock のパス・サイズ・mtime・プロセス確認
-  結果を添えて報告する。
+- 同じ失敗が3回改善しなければ停止し、実lock path・サイズ・mtime・プロセス確認
+  結果はlocal/private evidenceへ保持する。public/externalの停止報告では、下記の
+  sanitized lock placeholderとprocess command classを使う。
 
 ## 完了チェック
 
@@ -167,11 +174,17 @@ Windows で stale な `.git/index.lock`（または `.git/config.lock`）から�
 
 ## 報告
 
-- 対象 repo、lock のフルパス・サイズ・mtime。
-- 5点チェックの各結果（プロセス確認のコマンドライン内容を含む）。
-- 削除した lock の一覧（一括掃除の場合は repo ごとのフルパス。スキップした lock
-  と理由、フィルタで代替した条件も明記）。
-- 再実行した git 操作とその結果。
+- **local/private evidence:** 削除判断と保護された監査記録のために、対象repo、
+  実lock path、サイズ、mtime、raw process一覧を保持する。credential-bearing
+  outputをticketやchatへ転記しない。
+- **public/external report:** repoとlock pathは
+  `<repo>/.git/index.lock`のようなplaceholderへ置換する。process確認は
+  `no git.exe` / `read-only` / `index-writing`のcommand classだけを記載し、
+  PID、raw command line、remote URL、environment valueは省く。
+- 5点確認の各結果、削除・skipしたlockのplaceholderと理由、filterで代替した条件、
+  再実行したgit操作の結果を記載する。
+- security調査でprotected raw evidenceが必要ならpublic channelへ出さず、
+  repositoryのprivate security reportingを使う。
 - 確認できなかった項目は「未確認」と明記する。実測していない値を断定しない。
 
 ## 予防

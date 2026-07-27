@@ -32,7 +32,7 @@ powershell.exe -NoProfile -Command "[IO.File]::Open('<repo>\.git\index.lock','Op
 | Row 3 fails (lock is not 0 bytes) | Do not delete by default. Only if the remaining four pass AND the immediately preceding operation verifiably completed, deletion is acceptable (field-tested shape) |
 | Row 4 fails (mtime is fresh) | Do not delete — this may be a live operation. Recheck after your current work settles |
 | Row 5 fails (open throws) | Do not delete. Treat the lock as held by another process; skip and report. No forced deletion, no retry |
-| Same failure class three times in a row | Stop. Report the lock path, size, mtime, and the process-check output |
+| Same failure class three times in a row | Stop. Keep raw evidence local; a sanitized public report uses `<repo>` for the lock and only the process command class |
 
 ## What deletion is allowed to touch
 

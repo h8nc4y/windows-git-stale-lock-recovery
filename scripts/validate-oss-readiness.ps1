@@ -155,7 +155,8 @@ function Assert-FileContains {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    # UTF-8（BOMなし）の公開文書も Windows PowerShell 5.1 で同じ文字列として検査する。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
     if ($content -notmatch $Pattern) {
         Add-Failure "$RelativePath is missing: $Description"
     }
@@ -174,9 +175,58 @@ function Assert-FileOmits {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    # omission側も同じdecoderへ固定し、host差で禁止表現を見落とさない。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
     if ($content -match $Pattern) {
         Add-Failure "$RelativePath still contains: $Description"
+    }
+}
+
+function Assert-FileContractRejectsMutations {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [string]$Description,
+        [object[]]$Mutations
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    # 安全な定型文そのものをpositive contractとし、意味を反転した仮想文書を
+    # 同じpatternが受理しないことまで検査する。単なるkeyword順のgreenを防ぐ。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
+    if ($content -notmatch $Pattern) {
+        Add-Failure "$RelativePath is missing: $Description"
+        return
+    }
+
+    foreach ($mutation in $Mutations) {
+        $needle = [string]$mutation.Find
+        $replacement = [string]$mutation.Replace
+        $name = [string]$mutation.Name
+        if (-not $content.Contains($needle)) {
+            Add-Failure (
+                "$RelativePath mutation fixture is stale: " +
+                "$Description ($name)")
+            continue
+        }
+        if ($content.Contains($replacement)) {
+            Add-Failure (
+                "$RelativePath contains unsafe mutation text: " +
+                "$Description ($name)")
+        }
+
+        # filesystemは変更せず、現在の文書をmemory内だけで危険な表現へ反転する。
+        $mutatedContent = $content.Replace($needle, $replacement)
+        if ($mutatedContent -match $Pattern) {
+            Add-Failure (
+                "$RelativePath contract accepts unsafe mutation: " +
+                "$Description ($name)")
+        }
     }
 }
 
@@ -629,6 +679,136 @@ Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.loca
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?i)fails? closed' -Description 'fail-closed scanner boundary'
+# local診断のraw evidenceがpublic reportへ流れない二層境界を各入口で固定する。
+Assert-FileContains `
+    -RelativePath 'SKILL.md' `
+    -Pattern '(?is)## Reporting.*local/private evidence.*credential-bearing.*public or external report.*<repo>.*command class.*read-only.*index-writing.*raw command line' `
+    -Description 'canonical local evidence versus sanitized external report boundary'
+Assert-FileContains `
+    -RelativePath 'SKILL.md' `
+    -Pattern '(?is)bulk cleanup.*full-path output.*local/private audit.*sanitize' `
+    -Description 'bulk cleanup path output privacy boundary'
+Assert-FileContains `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Pattern '(?is)## 報告.*local/private.*credential-bearing.*public/external.*<repo>.*read-only.*index-writing.*raw command line' `
+    -Description 'Japanese local evidence versus sanitized external report boundary'
+Assert-FileContains `
+    -RelativePath 'README.md' `
+    -Pattern '(?is)## Safety Notes.*local/private evidence.*public or external report.*<repo>.*command class' `
+    -Description 'README reporting privacy boundary'
+Assert-FileContains `
+    -RelativePath 'SECURITY.md' `
+    -Pattern '(?is)Public Issue Safety.*raw process command lines.*command class.*private path' `
+    -Description 'public process evidence sanitization boundary'
+Assert-FileContains `
+    -RelativePath 'examples/single-lock-recovery-walkthrough.md' `
+    -Pattern '(?is)## Report template.*public/external.*<repo>.*command class.*raw command line.*check 1.*process class:\s*read-only' `
+    -Description 'sanitized walkthrough report template'
+Assert-FileOmits `
+    -RelativePath 'SKILL.md' `
+    -Pattern '(?is)print each deleted lock for the report|report it together with the lock''s path' `
+    -Description 'legacy unconditional raw-path report instructions'
+Assert-FileOmits `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Pattern '(?is)削除した\s*lock\s*を報告用に出力|lock\s*のパス・サイズ・mtime・プロセス確認\s*結果を添えて報告' `
+    -Description 'legacy Japanese unconditional raw-path report instructions'
+
+# 重要な動詞まで定型化し、意味反転したmemory上の文書を同じpatternが拒否する。
+Assert-FileContractRejectsMutations `
+    -RelativePath 'SKILL.md' `
+    -Pattern '(?is)\*\*Public or external report:\*\*.*?replace repository and lock paths with\s+placeholders such as `<repo>/\.git/index\.lock`\..*?Summarize the process check\s+only as a command class.*?omit PIDs, raw command lines, remote URLs, and environment values\.' `
+    -Description 'exact canonical public report privacy semantics' `
+    -Mutations @(
+        @{
+            Name = 'omit-to-include'
+            Find = 'omit PIDs, raw command lines, remote URLs, and environment values.'
+            Replace = 'include PIDs, raw command lines, remote URLs, and environment values.'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'SKILL.md' `
+    -Pattern '(?is)Every path-bearing line from this block is local/private audit evidence\. Sanitize it before external sharing\..*?\$lock\.FullName\s+# print each deleted lock for the local/private audit only.*?If the same failure does not improve after three attempts, stop and retain\s+the actual lock path, size, mtime, and process-check results as\s+local/private evidence\. A public or external stop report must use the\s+sanitized lock placeholder and process command class described below\.' `
+    -Description 'canonical bulk and stop-report local-only evidence semantics' `
+    -Mutations @(
+        @{
+            Name = 'bulk-local-to-public'
+            Find = 'for the local/private audit only'
+            Replace = 'for the public report'
+        },
+        @{
+            Name = 'stop-report-must-to-may-expose'
+            Find = 'A public or external stop report must use the'
+            Replace = 'A public or external stop report may expose the'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Pattern '(?is)このblockのpath付き出力はすべてlocal/private audit用。外部共有前にsanitizeする.*?\$lock\.FullName\s+# 削除したlockをlocal/private audit用にだけ出力.*?同じ失敗が3回改善しなければ停止し、実lock path・サイズ・mtime・プロセス確認\s+結果はlocal/private evidenceへ保持する。public/externalの停止報告では、下記の\s+sanitized lock placeholderとprocess command classを使う。' `
+    -Description 'Japanese bulk and stop-report local-only evidence semantics' `
+    -Mutations @(
+        @{
+            Name = 'bulk-local-to-public'
+            Find = 'local/private audit用にだけ出力'
+            Replace = 'public report用に出力'
+        },
+        @{
+            Name = 'stop-report-placeholder-to-real-path'
+            Find = 'public/externalの停止報告では、下記の'
+            Replace = 'public/externalの停止報告へ実pathを含め、下記の'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Pattern '(?is)\*\*public/external report:\*\*.*?<repo>/\.git/index\.lock`のようなplaceholderへ置換する。.*?command classだけを記載し、\s+PID、raw command line、remote URL、environment valueは省く。' `
+    -Description 'exact Japanese public report privacy semantics' `
+    -Mutations @(
+        @{
+            Name = 'omit-to-include'
+            Find = 'environment valueは省く。'
+            Replace = 'environment valueを含める。'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'README.md' `
+    -Pattern '(?is)Keep actual paths and raw process command lines as local/private evidence\.\s+In a public or external report, replace paths with `<repo>` placeholders\s+and share only the process command class' `
+    -Description 'exact README public report privacy semantics' `
+    -Mutations @(
+        @{
+            Name = 'share-class-to-raw-command'
+            Find = 'and share only the process command class'
+            Replace = 'and share the raw process command line'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'SECURITY.md' `
+    -Pattern '(?is)Raw process command lines are local/private evidence only.*?Public reports\s+must provide only the command class.*?use `<repo>` placeholders instead of a private path\.' `
+    -Description 'exact public issue process evidence semantics' `
+    -Mutations @(
+        @{
+            Name = 'class-only-to-raw-command'
+            Find = 'must provide only the command class'
+            Replace = 'may include the raw process command line'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'examples/single-lock-recovery-walkthrough.md' `
+    -Pattern '(?is)For a public/external report, keep `<repo>` as a placeholder and use only the\s+process command class.*?Never\s+paste a raw command line, PID, remote URL, or internal absolute path\.' `
+    -Description 'exact walkthrough public report privacy semantics' `
+    -Mutations @(
+        @{
+            Name = 'never-to-always'
+            Find = 'Never'
+            Replace = 'Always paste raw evidence'
+        })
+Assert-FileContractRejectsMutations `
+    -RelativePath 'examples/five-point-check-checklist.md' `
+    -Pattern '(?m)^\| Same failure class three times in a row \| Stop\. Keep raw evidence local; a sanitized public report uses `<repo>` for the lock and only the process command class \|$' `
+    -Description 'exact sanitized checklist stop-report semantics' `
+    -Mutations @(
+        @{
+            Name = 'keep-local-to-publish-raw'
+            Find = 'Keep raw evidence local'
+            Replace = 'Publish raw evidence'
+        },
+        @{
+            Name = 'class-only-to-includes'
+            Find = 'and only the process command class'
+            Replace = 'and includes the process command class'
+        })
 
 Test-SkillFrontmatter
 Assert-SelfTestProgressContract

@@ -207,6 +207,10 @@ Windows で sandbox 化された git プロセス（Codex アプリ等が短命�
   stale lock file is the only deletion target.
 - Never paste tokens, credentials, private logs, or customer data into
   issues or examples.
+- Keep actual paths and raw process command lines as local/private evidence.
+  In a public or external report, replace paths with `<repo>` placeholders
+  and share only the process command class (`no git.exe`, `read-only`, or
+  `index-writing`).
 
 ## Limitations
 
