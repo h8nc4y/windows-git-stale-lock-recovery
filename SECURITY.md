@@ -42,6 +42,12 @@ Public issues must not include:
   data.
 - Raw agent transcripts that contain any of the above.
 
+Raw process command lines are local/private evidence only because they may
+contain a credential-bearing remote URL or internal location. Public reports
+must provide only the command class (`no git.exe`, `read-only`, or
+`index-writing`) and use `<repo>` placeholders instead of a private path.
+If a maintainer needs the raw evidence, use private vulnerability reporting.
+
 ## PowerShell Module Cache Boundary
 
 Windows PowerShell 5.1 writes `ModuleAnalysisCache` asynchronously after

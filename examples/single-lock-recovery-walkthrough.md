@@ -88,15 +88,21 @@ test -e <repo>/.git/index.lock && echo "lock still present" || echo "no lock"
 - Step 5 throws: treat the lock as held by another process — skip, report,
   and never force-delete. (A FileNotFound-style error usually means a path
   problem instead; re-check the `<repo>` substitution.)
-- The same failure class three times in a row: stop and report the lock's
-  path, size, mtime, and the process-check output.
+- The same failure class three times in a row: stop, keep the actual lock
+  path and process-check output as local/private evidence, and use the
+  sanitized report boundary below for external sharing.
 
 ## Report template
+
+For a public/external report, keep `<repo>` as a placeholder and use only the
+process command class (`no git.exe`, `read-only`, or `index-writing`). Never
+paste a raw command line, PID, remote URL, or internal absolute path. Keep
+those details only in local/private evidence or a private security report.
 
 ```text
 repo: <repo>
 lock: <repo>/.git/index.lock  size=0  mtime=<timestamp>
-check 1 (no index-writing git): PASS - only short-lived "git status --porcelain" seen
+check 1 (no index-writing git): PASS - process class: read-only
 check 2 (intended repo):        PASS - matches rev-parse --absolute-git-dir
 check 3 (0 bytes):              PASS
 check 4 (old mtime):            PASS - predates session start

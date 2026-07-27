@@ -56,7 +56,9 @@ unverified).
    Short-lived `git status` processes from agent applications (for example
    the Codex app) can appear frequently. Confirm that **no** command line
    belongs to an index-writing operation (add / commit / merge / checkout,
-   and similar).
+   and similar). Treat the raw process listing as local/private evidence:
+   command lines can contain private paths or credential-bearing remote
+   URLs. Do not paste that raw output into a public or external report.
 3. **Inspect the lock file itself.**
    - PowerShell: `Get-Item -LiteralPath '<repo>\.git\index.lock' | Select-Object FullName,Length,LastWriteTime`
    - Git Bash: `ls -l <repo>/.git/index.lock`
@@ -119,6 +121,7 @@ unverified).
 
    ```powershell
    # Example (this one-shot bulk command itself is unverified; the measured record is per-repo deletion)
+   # Every path-bearing line from this block is local/private audit evidence. Sanitize it before external sharing.
    Get-CimInstance Win32_Process -Filter "Name='git.exe'"   # no output = no git right now (start-of-run snapshot)
    Get-ChildItem <workspace-root>\*\.git\index.lock -ErrorAction SilentlyContinue |
      Where-Object { $_.Length -eq 0 -and $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } |
@@ -128,7 +131,7 @@ unverified).
          # Condition 5: per-lock exclusive-open test. A lock that cannot be opened is treated as held by another process and skipped.
          $f = [IO.File]::Open($lock.FullName,'Open','Read','None'); $f.Close()
          Remove-Item -LiteralPath $lock.FullName -Confirm:$false
-         $lock.FullName   # print each deleted lock for the report
+         $lock.FullName   # print each deleted lock for the local/private audit only
        } catch {
          Write-Warning "Skipped (exclusive open or delete failed; no forced delete, no retry): $($lock.FullName)"
        }
@@ -148,7 +151,11 @@ unverified).
      2 (intended repository) is substituted here by the glob pattern
      `<workspace-root>\*\.git\index.lock` (it matches only a `.git`
      directly under each repository root), so list the full paths of the
-     deleted locks in your report and state that the substitution was used.
+     deleted locks in the local audit record and state that the substitution
+     was used.
+   - For bulk cleanup, the full-path output is local/private audit evidence.
+     Sanitize every path to a placeholder such as
+     `<repo>/.git/index.lock` before public or external sharing.
 
 ## Safety Conditions
 
@@ -169,29 +176,33 @@ Stop / prohibited conditions:
   example: retry the blocked git operation at most 2–3 times, redoing the
   five-point check each time; no unbounded waiting, no foreground sleep, no
   "leave it to clear on its own"). If the same failure class does not
-  improve after three attempts, stop and report the situation.
+  improve after three attempts, stop and report the situation through the
+  sanitized boundary below.
 - Delete only the lock file itself. Never touch `.git/index`,
   `.git/config`, or anything else inside `.git`.
 - Killing processes and disabling the sandbox are out of scope for this
   skill. Even when a kill looks necessary, do not block waiting for a human
   decision; record the situation (process IDs, command lines, and the
-  lock's path/size/mtime) for your report, and continue with kill-free
-  alternatives (serialization, bounded rechecks). If that does not improve
-  after three attempts, stop and report.
+  lock's path/size/mtime) as local/private evidence, and continue with
+  kill-free alternatives (serialization, bounded rechecks). If that does not
+  improve after three attempts, stop and report through the sanitized
+  boundary below.
 - The five-point check applies per lock even in bulk cleanup. Because the
   process check (condition 1) is only a start-of-run snapshot, the mtime
   filter and the per-lock exclusive open (condition 5) are mandatory; skip
-  and report any lock that fails the exclusive open or the delete (no
-  forced deletion, no retry). When part of the five-point check is
-  substituted by a filter, name the substituted condition in the report.
+  the lock when the exclusive open or delete fails (no forced deletion, no
+  retry). Retain the actual path locally and report only its sanitized
+  placeholder and reason. When part of the five-point check is substituted
+  by a filter, name the substituted condition in the report.
 - As a rule, do not delete locks that are not 0 bytes. A lock the same size
   as the index has been observed left behind after a completed operation
   (field-tested); even then, delete only when the remaining four conditions
   hold and you can confirm that the immediately preceding operation
   completed.
-- If the same failure does not improve after three attempts, stop and
-  report it together with the lock's path, size, and mtime, and the
-  process-check results.
+- If the same failure does not improve after three attempts, stop and retain
+  the actual lock path, size, mtime, and process-check results as
+  local/private evidence. A public or external stop report must use the
+  sanitized lock placeholder and process command class described below.
 
 ## Completion Checklist
 
@@ -205,13 +216,20 @@ Stop / prohibited conditions:
 
 ## Reporting
 
-- The target repository, and the lock's full path, size, and mtime.
-- The result of each of the five checks (including the command lines seen
-  in the process check).
-- The list of deleted locks (for bulk cleanup: the full path per
-  repository; also skipped locks with reasons, and any condition that was
-  substituted by a filter).
-- The re-run git operation and its result.
+- **Local/private evidence:** retain the target repository, actual lock path,
+  size, mtime, and the raw process listing only for the bounded deletion
+  decision and a protected audit record. Do not copy credential-bearing
+  output into a ticket or chat.
+- **Public or external report:** replace repository and lock paths with
+  placeholders such as `<repo>/.git/index.lock`. Summarize the process check
+  only as a command class (`no git.exe`, `read-only`, or `index-writing`);
+  omit PIDs, raw command lines, remote URLs, and environment values.
+- Report the result of each five-point check, the deleted/skipped lock
+  placeholders and reasons, any condition substituted by a filter, and the
+  re-run git operation's result.
+- If protected raw evidence is necessary for a security investigation, keep
+  it out of public channels and use the repository's private security
+  reporting path.
 - Mark anything you could not confirm as "unverified." Never assert values
   you did not measure.
 

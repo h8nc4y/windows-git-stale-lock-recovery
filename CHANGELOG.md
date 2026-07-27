@@ -8,6 +8,13 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Split stale-lock reporting into local/private evidence and sanitized
+  public/external summaries. Public reports now use repository placeholders
+  and process command classes instead of raw command lines, PIDs, remote URLs,
+  or internal absolute paths; the five-point deletion gate is unchanged.
+  OSS readiness also reads UTF-8 public documents explicitly so Windows
+  PowerShell 5.1 enforces the Japanese reporting contract consistently, and
+  rejects in-memory unsafe verb reversals of the fixed reporting semantics.
 - Hardened all three PowerShell entrypoints so omitted `-Path` still selects the
   repository root while explicit empty, whitespace-only, missing, or otherwise
   unresolvable roots fail closed with entrypoint-specific fixed UTF-8
